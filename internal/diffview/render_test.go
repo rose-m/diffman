@@ -62,6 +62,65 @@ func TestRenderSplitUsesAddRemoveMarkersForSingleSidedRows(t *testing.T) {
 	}
 }
 
+func TestRenderSplitWithLayoutKeepsRowsAlignedWhenWrapping(t *testing.T) {
+	rows := []DiffRow{
+		{
+			Kind:    RowChange,
+			Path:    "a.txt",
+			OldLine: intPtr(10),
+			NewLine: intPtr(10),
+			OldText: "old side has a much longer line than new side",
+			NewText: "short",
+		},
+		{
+			Kind:    RowContext,
+			Path:    "a.txt",
+			OldLine: intPtr(11),
+			NewLine: intPtr(11),
+			OldText: "next",
+			NewText: "next",
+		},
+	}
+
+	out := RenderSplitWithLayout(rows, 20, 20, 0, nil)
+	if len(out.RowStarts) != len(rows) || len(out.RowHeights) != len(rows) {
+		t.Fatalf("unexpected row map sizes starts=%d heights=%d", len(out.RowStarts), len(out.RowHeights))
+	}
+	if len(out.OldLines) != len(out.NewLines) {
+		t.Fatalf("old/new visual line counts differ old=%d new=%d", len(out.OldLines), len(out.NewLines))
+	}
+	if out.RowHeights[0] <= 1 {
+		t.Fatalf("expected wrapped first row height > 1, got %d", out.RowHeights[0])
+	}
+	if out.RowStarts[1] != out.RowStarts[0]+out.RowHeights[0] {
+		t.Fatalf("second row start misaligned: got %d want %d", out.RowStarts[1], out.RowStarts[0]+out.RowHeights[0])
+	}
+}
+
+func TestRenderSplitWithLayoutExpandsTabsBeforeWrapping(t *testing.T) {
+	rows := []DiffRow{
+		{
+			Kind:    RowAdd,
+			Path:    "a.txt",
+			NewLine: intPtr(5),
+			NewText: "\tif len(items) > 0 {\treturn items[0]\t}",
+		},
+	}
+
+	out := RenderSplitWithLayout(rows, 24, 24, 0, nil)
+	if len(out.OldLines) != len(out.NewLines) {
+		t.Fatalf("old/new visual line counts differ old=%d new=%d", len(out.OldLines), len(out.NewLines))
+	}
+	for i, line := range out.NewLines {
+		if strings.ContainsRune(line, '\t') {
+			t.Fatalf("new line %d still contains tab: %q", i, line)
+		}
+		if len([]rune(line)) > 24 {
+			t.Fatalf("new line %d exceeds width: %q", i, line)
+		}
+	}
+}
+
 func intPtr(n int) *int {
 	v := n
 	return &v

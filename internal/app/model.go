@@ -68,6 +68,8 @@ type Model struct {
 
 	diffRows   []diffview.DiffRow
 	diffCursor int
+	rowStarts  []int
+	rowHeights []int
 	oldView    viewport.Model
 	newView    viewport.Model
 	helpOpen   bool
@@ -156,6 +158,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectedF = ""
 			m.diffRows = nil
 			m.diffCursor = 0
+			m.rowStarts = nil
+			m.rowHeights = nil
 			m.diffDirty = false
 			m.oldView.GotoTop()
 			m.newView.GotoTop()
@@ -175,6 +179,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 		if msg.err != nil {
 			m.diffRows = nil
+			m.rowStarts = nil
+			m.rowHeights = nil
 			m.diffDirty = false
 			errMsg := fmt.Sprintf("Failed to load diff for %s:\n%v", msg.path, msg.err)
 			m.oldView.SetContent(errMsg)
@@ -184,6 +190,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.empty || len(msg.rows) == 0 {
 			m.diffRows = nil
 			m.diffCursor = 0
+			m.rowStarts = nil
+			m.rowHeights = nil
 			m.diffDirty = false
 			noDiff := fmt.Sprintf("No diff for %s.", msg.path)
 			m.oldView.SetContent(noDiff)
@@ -218,6 +226,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.focus = focusFiles
 			}
+			return m, nil
+		}
+		if key.Matches(msg, m.keys.FocusFiles) {
+			m.focus = focusFiles
+			return m, nil
+		}
+		if key.Matches(msg, m.keys.FocusDiff) {
+			m.focus = focusDiff
 			return m, nil
 		}
 		if key.Matches(msg, m.keys.Help) {
@@ -255,17 +271,29 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch {
 	case key.Matches(msg, m.keys.Up):
+		prev := m.selected
 		if m.selected > 0 {
 			m.selected--
 		}
 		m.selectedF = m.fileItems[m.selected].Path
+		if m.selected != prev {
+			m.loadingDiff = true
+			m.statusMsg = ""
+			return m, m.loadDiffCmd(m.selectedF)
+		}
 		return m, nil
 
 	case key.Matches(msg, m.keys.Down):
+		prev := m.selected
 		if m.selected < len(m.fileItems)-1 {
 			m.selected++
 		}
 		m.selectedF = m.fileItems[m.selected].Path
+		if m.selected != prev {
+			m.loadingDiff = true
+			m.statusMsg = ""
+			return m, m.loadDiffCmd(m.selectedF)
+		}
 		return m, nil
 
 	case key.Matches(msg, m.keys.Open):
@@ -498,10 +526,10 @@ func (m Model) View() string {
 		return "Loading..."
 	}
 
-	help := "tab focus | j/k move | enter open diff | t mode | c/e/d comment | n/p comment nav | y export | r refresh | ? help | q quit"
+	help := "tab focus | h/l focus panes | j/k move | enter open diff | t mode | c/e/d comment | n/p comment nav | y export | r refresh | ? help | q quit"
 	if m.helpOpen {
 		help = strings.Join([]string{
-			"Global: q quit, tab switch focus, t toggle diff mode, ? toggle help",
+			"Global: q quit, tab switch focus, h files focus, l diff focus, t toggle diff mode, ? toggle help",
 			"Files pane: j/k move, enter open diff, r refresh",
 			"Diff pane: j/k move cursor, g/G top/bottom",
 			"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard",
@@ -529,8 +557,8 @@ func (m Model) View() string {
 	oldPaneW, newPaneW := splitRightPanes(rightW)
 	// lipgloss Height applies to content height; borders add 2 more rows.
 	paneContentHeight := max(1, m.height-footerHeight-2)
-	newOldWidth := max(1, oldPaneW-4)
-	newNewWidth := max(1, newPaneW-4)
+	newOldWidth := max(1, oldPaneW)
+	newNewWidth := max(1, newPaneW)
 	if m.oldView.Width != newOldWidth || m.newView.Width != newNewWidth {
 		m.diffDirty = true
 	}
@@ -565,7 +593,7 @@ func (m Model) renderFilesPane(width, height int) string {
 		title += " (loading...)"
 	}
 
-	innerW := max(1, width-4)
+	innerW := max(1, width)
 	bodyLines := make([]string, 0, len(m.fileItems)+2)
 	bodyLines = append(bodyLines, title)
 	bodyLines = append(bodyLines, "")
@@ -596,12 +624,12 @@ func (m Model) renderFilesPane(width, height int) string {
 }
 
 func (m Model) renderDiffPanes(oldWidth, newWidth, height int) string {
-	oldPane := m.renderDiffSidePane(oldWidth, height, "Old", m.oldView.View())
-	newPane := m.renderDiffSidePane(newWidth, height, "New", m.newView.View())
+	oldPane := m.renderDiffSidePane(oldWidth, height, "Old", m.oldView.View(), false)
+	newPane := m.renderDiffSidePane(newWidth, height, "New", m.newView.View(), true)
 	return lipgloss.JoinHorizontal(lipgloss.Top, oldPane, newPane)
 }
 
-func (m Model) renderDiffSidePane(width, height int, sideLabel, body string) string {
+func (m Model) renderDiffSidePane(width, height int, sideLabel, body string, withRightBorder bool) string {
 	border := lipgloss.NormalBorder()
 	borderColor := lipgloss.Color("245")
 	if m.focus == focusDiff {
@@ -611,7 +639,7 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string) str
 	paneStyle := lipgloss.NewStyle().
 		Width(max(1, width)).
 		Height(max(1, height)).
-		Border(border).
+		Border(border, true, withRightBorder, true, true).
 		BorderForeground(borderColor)
 
 	title := sideLabel
@@ -623,7 +651,7 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string) str
 		title += " (loading...)"
 	}
 
-	innerW := max(1, width-4)
+	innerW := max(1, width)
 	header := lipgloss.NewStyle().Bold(true).Width(innerW).MaxWidth(innerW).Render(title)
 
 	return paneStyle.Render(header + "\n\n" + body)
@@ -632,8 +660,8 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string) str
 func (m *Model) resizePanes() {
 	_, rightW := paneWidths(m.width)
 	oldPaneW, newPaneW := splitRightPanes(rightW)
-	m.oldView.Width = max(1, oldPaneW-4)
-	m.newView.Width = max(1, newPaneW-4)
+	m.oldView.Width = max(1, oldPaneW)
+	m.newView.Width = max(1, newPaneW)
 	m.oldView.Height = max(1, m.height-6)
 	m.newView.Height = max(1, m.height-6)
 	m.diffDirty = true
@@ -718,7 +746,7 @@ func (m *Model) refreshDiffContent() {
 		return
 	}
 
-	oldLines, newLines := diffview.RenderSplit(
+	rendered := diffview.RenderSplitWithLayout(
 		m.diffRows,
 		m.oldView.Width,
 		m.newView.Width,
@@ -727,8 +755,10 @@ func (m *Model) refreshDiffContent() {
 			return m.hasComment(path, line, side)
 		},
 	)
-	m.oldView.SetContent(strings.Join(oldLines, "\n"))
-	m.newView.SetContent(strings.Join(newLines, "\n"))
+	m.oldView.SetContent(strings.Join(rendered.OldLines, "\n"))
+	m.newView.SetContent(strings.Join(rendered.NewLines, "\n"))
+	m.rowStarts = rendered.RowStarts
+	m.rowHeights = rendered.RowHeights
 	m.oldWidth = m.oldView.Width
 	m.newWidth = m.newView.Width
 	m.diffDirty = false
@@ -743,17 +773,33 @@ func (m *Model) ensureCursorVisible() {
 	if visibleHeight <= 0 {
 		return
 	}
-	if m.diffCursor < m.oldView.YOffset {
-		m.oldView.SetYOffset(m.diffCursor)
-		m.newView.SetYOffset(m.diffCursor)
+	start, end := m.cursorVisualRange()
+	if start < m.oldView.YOffset {
+		m.oldView.SetYOffset(start)
+		m.newView.SetYOffset(start)
 		return
 	}
 	bottom := m.oldView.YOffset + visibleHeight - 1
-	if m.diffCursor > bottom {
-		next := m.diffCursor - visibleHeight + 1
+	if end > bottom {
+		next := end - visibleHeight + 1
 		m.oldView.SetYOffset(next)
 		m.newView.SetYOffset(next)
 	}
+}
+
+func (m *Model) cursorVisualRange() (int, int) {
+	if len(m.rowStarts) != len(m.diffRows) || len(m.rowHeights) != len(m.diffRows) {
+		return m.diffCursor, m.diffCursor
+	}
+	if m.diffCursor < 0 || m.diffCursor >= len(m.rowStarts) {
+		return 0, 0
+	}
+	start := m.rowStarts[m.diffCursor]
+	height := m.rowHeights[m.diffCursor]
+	if height <= 0 {
+		height = 1
+	}
+	return start, start + height - 1
 }
 
 func (m *Model) clampDiffCursor() {
