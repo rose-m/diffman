@@ -93,14 +93,26 @@ func renderRowSegments(row DiffRow, side Side, width, numW int, isCursor bool, h
 	contPrefix := "   "
 	lineWidth := maxInt(1, width-len(prefix))
 
-	var text string
 	switch row.Kind {
 	case RowFileHeader, RowHunkHeader:
-		text = row.OldText
+		text := row.OldText
 		if text == "" {
 			text = row.NewText
 		}
 		text = normalizeDisplayText(text)
+		chunks := wrapRunes(text, lineWidth)
+		out := make([]string, 0, len(chunks))
+		for i, chunk := range chunks {
+			p := contPrefix
+			if i == 0 {
+				p = prefix
+			}
+			out = append(out, p+padRight(chunk, lineWidth))
+		}
+		if len(out) == 0 {
+			out = append(out, prefix+strings.Repeat(" ", lineWidth))
+		}
+		return out
 
 	default:
 		lineNo, sideText, marker, ok := sideContent(row, side)
@@ -111,22 +123,22 @@ func renderRowSegments(row DiffRow, side Side, width, numW int, isCursor bool, h
 		if lineNo != nil {
 			num = fmt.Sprintf("%d", *lineNo)
 		}
-		text = fmt.Sprintf("%c %*s %s", marker, numW, num, normalizeDisplayText(sideText))
-	}
-
-	chunks := wrapRunes(text, lineWidth)
-	out := make([]string, 0, len(chunks))
-	for i, chunk := range chunks {
-		p := contPrefix
-		if i == 0 {
-			p = prefix
+		meta := fmt.Sprintf("%c %*s ", marker, numW, num)
+		metaWidth := len([]rune(meta))
+		textWidth := maxInt(1, lineWidth-metaWidth)
+		chunks := wrapRunes(normalizeDisplayText(sideText), textWidth)
+		if len(chunks) == 0 {
+			chunks = []string{""}
 		}
-		out = append(out, p+padRight(chunk, lineWidth))
+
+		out := make([]string, 0, len(chunks))
+		out = append(out, prefix+meta+padRight(chunks[0], textWidth))
+		contMeta := strings.Repeat(" ", metaWidth)
+		for _, chunk := range chunks[1:] {
+			out = append(out, contPrefix+contMeta+padRight(chunk, textWidth))
+		}
+		return out
 	}
-	if len(out) == 0 {
-		out = append(out, prefix+strings.Repeat(" ", lineWidth))
-	}
-	return out
 }
 
 func sideContent(row DiffRow, side Side) (*int, string, rune, bool) {

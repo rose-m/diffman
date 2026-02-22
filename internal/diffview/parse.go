@@ -16,11 +16,6 @@ func ParseUnifiedDiff(raw []byte) ([]DiffRow, error) {
 	rows := make([]DiffRow, 0, 64)
 	for _, fd := range fileDiffs {
 		path := normalizePath(fd)
-		rows = append(rows, DiffRow{
-			Kind:    RowFileHeader,
-			OldText: fmt.Sprintf("File: %s", path),
-			Path:    path,
-		})
 
 		for hunkID, h := range fd.Hunks {
 			rows = append(rows, DiffRow{

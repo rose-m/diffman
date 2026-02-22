@@ -121,6 +121,31 @@ func TestRenderSplitWithLayoutExpandsTabsBeforeWrapping(t *testing.T) {
 	}
 }
 
+func TestRenderSplitWithLayoutContinuationKeepsLineNumberIndent(t *testing.T) {
+	rows := []DiffRow{
+		{
+			Kind:    RowAdd,
+			Path:    "a.txt",
+			NewLine: intPtr(12),
+			NewText: "abcdefghijklmnopqrstuvwxyz",
+		},
+	}
+
+	out := RenderSplitWithLayout(rows, 22, 22, 0, nil)
+	if len(out.NewLines) < 2 {
+		t.Fatalf("expected wrapped output, got %d visual lines", len(out.NewLines))
+	}
+
+	// Prefix (3) + meta for '+ %3d ' (6) => continuation text begins at column 10.
+	wantPrefix := strings.Repeat(" ", 9)
+	if !strings.HasPrefix(out.NewLines[1], wantPrefix) {
+		t.Fatalf("continuation line does not keep line-number indent: %q", out.NewLines[1])
+	}
+	if len([]rune(out.NewLines[1])) <= len([]rune(wantPrefix)) || []rune(out.NewLines[1])[len([]rune(wantPrefix))] == ' ' {
+		t.Fatalf("continuation line does not keep line-number indent: %q", out.NewLines[1])
+	}
+}
+
 func intPtr(n int) *int {
 	v := n
 	return &v

@@ -21,11 +21,11 @@ index 1111111..2222222 100644
 	if err != nil {
 		t.Fatalf("ParseUnifiedDiff returned error: %v", err)
 	}
-	if len(rows) < 7 {
-		t.Fatalf("expected at least 7 rows, got %d", len(rows))
+	if len(rows) < 6 {
+		t.Fatalf("expected at least 6 rows, got %d", len(rows))
 	}
 
-	content := rows[2:]
+	content := rows[1:]
 	if got, want := content[0].Kind, RowContext; got != want {
 		t.Fatalf("row 0 kind = %v, want %v", got, want)
 	}
@@ -71,21 +71,21 @@ index 0000000..3b18e13
 	if err != nil {
 		t.Fatalf("ParseUnifiedDiff returned error: %v", err)
 	}
-	if len(rows) < 4 {
-		t.Fatalf("expected at least 4 rows, got %d", len(rows))
+	if len(rows) < 3 {
+		t.Fatalf("expected at least 3 rows, got %d", len(rows))
 	}
 
-	if rows[0].Kind != RowFileHeader {
-		t.Fatalf("first row kind = %v, want RowFileHeader", rows[0].Kind)
+	if rows[0].Kind != RowHunkHeader {
+		t.Fatalf("first row kind = %v, want RowHunkHeader", rows[0].Kind)
 	}
-	if rows[2].Kind != RowAdd || rows[3].Kind != RowAdd {
-		t.Fatalf("expected add rows, got %v and %v", rows[2].Kind, rows[3].Kind)
+	if rows[1].Kind != RowAdd || rows[2].Kind != RowAdd {
+		t.Fatalf("expected add rows, got %v and %v", rows[1].Kind, rows[2].Kind)
 	}
-	if rows[2].OldLine != nil || rows[3].OldLine != nil {
+	if rows[1].OldLine != nil || rows[2].OldLine != nil {
 		t.Fatalf("expected old lines to be nil for new file additions")
 	}
-	assertLine(t, rows[2].NewLine, 1)
-	assertLine(t, rows[3].NewLine, 2)
+	assertLine(t, rows[1].NewLine, 1)
+	assertLine(t, rows[2].NewLine, 2)
 }
 
 func assertLine(t *testing.T, got *int, want int) {
