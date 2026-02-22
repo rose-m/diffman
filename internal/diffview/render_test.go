@@ -1,9 +1,14 @@
 package diffview
 
 import (
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/charmbracelet/lipgloss"
 )
+
+var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 func TestRenderSplitIncludesCursorAndSideCommentMarkers(t *testing.T) {
 	rows := []DiffRow{
@@ -20,20 +25,20 @@ func TestRenderSplitIncludesCursorAndSideCommentMarkers(t *testing.T) {
 		t.Fatalf("line counts mismatch old=%d new=%d rows=%d", len(oldLines), len(newLines), len(rows))
 	}
 
-	if !strings.HasPrefix(oldLines[1], ">  ") {
-		t.Fatalf("expected cursor-only marker on old row 1, got %q", oldLines[1])
+	if !strings.HasPrefix(stripANSI(oldLines[1]), ">C ") {
+		t.Fatalf("expected cursor+comment marker on old row 1, got %q", oldLines[1])
 	}
-	if !strings.HasPrefix(newLines[1], ">* ") {
+	if !strings.HasPrefix(stripANSI(newLines[1]), ">C ") {
 		t.Fatalf("expected cursor+comment marker on new row 1, got %q", newLines[1])
 	}
 
 	for i, line := range oldLines {
-		if len([]rune(line)) > 30 {
+		if lipgloss.Width(line) > 30 {
 			t.Fatalf("old line %d exceeds width: %q", i, line)
 		}
 	}
 	for i, line := range newLines {
-		if len([]rune(line)) > 30 {
+		if lipgloss.Width(line) > 30 {
 			t.Fatalf("new line %d exceeds width: %q", i, line)
 		}
 	}
@@ -46,19 +51,23 @@ func TestRenderSplitUsesAddRemoveMarkersForSingleSidedRows(t *testing.T) {
 	}
 
 	oldLines, newLines := RenderSplit(rows, 40, 40, 0, nil)
+	old0 := stripANSI(oldLines[0])
+	new0 := stripANSI(newLines[0])
+	old1 := stripANSI(oldLines[1])
+	new1 := stripANSI(newLines[1])
 
-	if !strings.Contains(oldLines[0], "-   5 gone") {
-		t.Fatalf("expected removed marker in old pane, got %q", oldLines[0])
+	if !strings.Contains(old0, "-   5 gone") {
+		t.Fatalf("expected removed marker in old pane, got %q", old0)
 	}
-	if strings.TrimSpace(newLines[0]) != ">" {
-		t.Fatalf("expected blank new-side delete row except cursor prefix, got %q", newLines[0])
+	if strings.TrimSpace(new0) != ">" {
+		t.Fatalf("expected blank new-side delete row except cursor prefix, got %q", new0)
 	}
 
-	if strings.TrimSpace(oldLines[1]) != "" {
-		t.Fatalf("expected blank old-side add row, got %q", oldLines[1])
+	if strings.TrimSpace(old1) != "" {
+		t.Fatalf("expected blank old-side add row, got %q", old1)
 	}
-	if !strings.Contains(newLines[1], "+   8 new") {
-		t.Fatalf("expected added marker in new pane, got %q", newLines[1])
+	if !strings.Contains(new1, "+   8 new") {
+		t.Fatalf("expected added marker in new pane, got %q", new1)
 	}
 }
 
@@ -112,10 +121,11 @@ func TestRenderSplitWithLayoutExpandsTabsBeforeWrapping(t *testing.T) {
 		t.Fatalf("old/new visual line counts differ old=%d new=%d", len(out.OldLines), len(out.NewLines))
 	}
 	for i, line := range out.NewLines {
-		if strings.ContainsRune(line, '\t') {
-			t.Fatalf("new line %d still contains tab: %q", i, line)
+		plain := stripANSI(line)
+		if strings.ContainsRune(plain, '\t') {
+			t.Fatalf("new line %d still contains tab: %q", i, plain)
 		}
-		if len([]rune(line)) > 24 {
+		if lipgloss.Width(line) > 24 {
 			t.Fatalf("new line %d exceeds width: %q", i, line)
 		}
 	}
@@ -136,14 +146,84 @@ func TestRenderSplitWithLayoutContinuationKeepsLineNumberIndent(t *testing.T) {
 		t.Fatalf("expected wrapped output, got %d visual lines", len(out.NewLines))
 	}
 
+	plain := stripANSI(out.NewLines[1])
 	// Prefix (3) + meta for '+ %3d ' (6) => continuation text begins at column 10.
 	wantPrefix := strings.Repeat(" ", 9)
-	if !strings.HasPrefix(out.NewLines[1], wantPrefix) {
-		t.Fatalf("continuation line does not keep line-number indent: %q", out.NewLines[1])
+	if !strings.HasPrefix(plain, wantPrefix) {
+		t.Fatalf("continuation line does not keep line-number indent: %q", plain)
 	}
-	if len([]rune(out.NewLines[1])) <= len([]rune(wantPrefix)) || []rune(out.NewLines[1])[len([]rune(wantPrefix))] == ' ' {
-		t.Fatalf("continuation line does not keep line-number indent: %q", out.NewLines[1])
+	if len([]rune(plain)) <= len([]rune(wantPrefix)) || []rune(plain)[len([]rune(wantPrefix))] == ' ' {
+		t.Fatalf("continuation line does not keep line-number indent: %q", plain)
 	}
+}
+
+func TestRenderSplitWithLayoutHighlightsChangedWords(t *testing.T) {
+	rows := []DiffRow{
+		{
+			Kind:    RowChange,
+			Path:    "a.txt",
+			OldLine: intPtr(3),
+			NewLine: intPtr(3),
+			OldText: "alpha beta gamma",
+			NewText: "alpha zeta gamma",
+		},
+	}
+
+	out := RenderSplitWithLayout(rows, 40, 40, 0, nil)
+	if !strings.Contains(stripANSI(out.OldLines[0]), "beta") || !strings.Contains(stripANSI(out.NewLines[0]), "zeta") {
+		t.Fatalf("expected changed words in output old=%q new=%q", stripANSI(out.OldLines[0]), stripANSI(out.NewLines[0]))
+	}
+
+	oldRanges, newRanges := changedWordRanges(normalizeDisplayText(rows[0].OldText), normalizeDisplayText(rows[0].NewText))
+	if len(oldRanges) == 0 || len(newRanges) == 0 {
+		t.Fatalf("expected non-empty changed-word ranges old=%v new=%v", oldRanges, newRanges)
+	}
+}
+
+func TestRenderSplitShowsCommentMarkerOnBothPanes(t *testing.T) {
+	rows := []DiffRow{
+		{Kind: RowChange, Path: "a.txt", OldLine: intPtr(4), NewLine: intPtr(4), OldText: "old", NewText: "new"},
+	}
+
+	out := RenderSplitWithLayout(rows, 30, 30, 0, func(path string, line int, side Side) bool {
+		return path == "a.txt" && line == 4 && side == SideNew
+	})
+
+	if !strings.HasPrefix(stripANSI(out.OldLines[0]), ">C ") {
+		t.Fatalf("expected comment marker on old pane row, got %q", stripANSI(out.OldLines[0]))
+	}
+	if !strings.HasPrefix(stripANSI(out.NewLines[0]), ">C ") {
+		t.Fatalf("expected comment marker on new pane row, got %q", stripANSI(out.NewLines[0]))
+	}
+}
+
+func TestRenderSplitWithLayoutCursorStylingDoesNotChangeWrapWidth(t *testing.T) {
+	rows := []DiffRow{
+		{
+			Kind:    RowAdd,
+			Path:    "a.txt",
+			NewLine: intPtr(7),
+			NewText: "this is a fairly long wrapped line for cursor width checks",
+		},
+	}
+
+	unstyled := RenderSplitWithLayout(rows, 24, 24, -1, nil)
+	styled := RenderSplitWithLayout(rows, 24, 24, 0, func(path string, line int, side Side) bool {
+		return path == "a.txt" && line == 7 && side == SideNew
+	})
+
+	if styled.RowHeights[0] != unstyled.RowHeights[0] {
+		t.Fatalf("cursor/comment styling changed wrap height: styled=%d unstyled=%d", styled.RowHeights[0], unstyled.RowHeights[0])
+	}
+	for i, line := range styled.NewLines {
+		if lipgloss.Width(line) != 24 {
+			t.Fatalf("styled line %d visual width = %d, want 24: %q", i, lipgloss.Width(line), line)
+		}
+	}
+}
+
+func stripANSI(s string) string {
+	return ansiRE.ReplaceAllString(s, "")
 }
 
 func intPtr(n int) *int {

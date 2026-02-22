@@ -3,6 +3,9 @@ package diffview
 import (
 	"fmt"
 	"strings"
+	"unicode"
+
+	"github.com/charmbracelet/lipgloss"
 )
 
 type SplitRender struct {
@@ -11,6 +14,40 @@ type SplitRender struct {
 	RowStarts  []int
 	RowHeights []int
 }
+
+type textRange struct {
+	start int
+	end   int
+}
+
+type wrappedChunk struct {
+	text  string
+	start int
+}
+
+type token struct {
+	text    string
+	isSpace bool
+	start   int
+	end     int
+}
+
+var (
+	addBaseStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
+	deleteBaseStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+	changeOldBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("210"))
+	changeNewBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("121"))
+	contextBaseStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	hunkBaseStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
+
+	addWordStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("22")).Bold(true)
+	deleteWordStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("52")).Bold(true)
+	cursorRowBg     = lipgloss.Color("236")
+
+	cursorGutterStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("45")).Bold(true)
+	commentGutterStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("220")).Bold(true)
+	cursorCommentGutterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("201")).Bold(true)
+)
 
 func RenderSplit(
 	rows []DiffRow,
@@ -79,66 +116,304 @@ func RenderSplitWithLayout(
 }
 
 func renderRowSegments(row DiffRow, side Side, width, numW int, isCursor bool, hasComment func(path string, line int, side Side) bool) []string {
-	cursorMark := " "
-	if isCursor {
-		cursorMark = ">"
-	}
-
-	commentMark := " "
-	if hasCommentOnSide(row, side, hasComment) {
-		commentMark = "*"
-	}
-
-	prefix := cursorMark + commentMark + " "
+	hasAnyComment := hasCommentOnAnySide(row, hasComment)
+	prefix := renderGutterPrefix(isCursor, hasAnyComment)
 	contPrefix := "   "
-	lineWidth := maxInt(1, width-len(prefix))
+	lineWidth := maxInt(1, width-lipgloss.Width(prefix))
 
 	switch row.Kind {
-	case RowFileHeader, RowHunkHeader:
+	case RowHunkHeader:
 		text := row.OldText
 		if text == "" {
 			text = row.NewText
 		}
 		text = normalizeDisplayText(text)
-		chunks := wrapRunes(text, lineWidth)
+		chunks := wrapRunesWithOffsets(text, lineWidth)
 		out := make([]string, 0, len(chunks))
 		for i, chunk := range chunks {
 			p := contPrefix
 			if i == 0 {
 				p = prefix
 			}
-			out = append(out, p+padRight(chunk, lineWidth))
+			hstyle := hunkBaseStyle
+			if isCursor {
+				hstyle = hstyle.Background(cursorRowBg)
+			}
+			styled := hstyle.Render(chunk.text)
+			out = append(out, p+styled+strings.Repeat(" ", lineWidth-len([]rune(chunk.text))))
 		}
 		if len(out) == 0 {
 			out = append(out, prefix+strings.Repeat(" ", lineWidth))
 		}
 		return out
 
-	default:
-		lineNo, sideText, marker, ok := sideContent(row, side)
-		if !ok {
-			return []string{prefix + strings.Repeat(" ", lineWidth)}
-		}
-		num := ""
-		if lineNo != nil {
-			num = fmt.Sprintf("%d", *lineNo)
-		}
-		meta := fmt.Sprintf("%c %*s ", marker, numW, num)
-		metaWidth := len([]rune(meta))
-		textWidth := maxInt(1, lineWidth-metaWidth)
-		chunks := wrapRunes(normalizeDisplayText(sideText), textWidth)
-		if len(chunks) == 0 {
-			chunks = []string{""}
-		}
-
-		out := make([]string, 0, len(chunks))
-		out = append(out, prefix+meta+padRight(chunks[0], textWidth))
-		contMeta := strings.Repeat(" ", metaWidth)
-		for _, chunk := range chunks[1:] {
-			out = append(out, contPrefix+contMeta+padRight(chunk, textWidth))
-		}
-		return out
+	case RowFileHeader:
+		// File headers are no longer emitted by parser; keep safe behavior.
+		return []string{prefix + strings.Repeat(" ", lineWidth)}
 	}
+
+	lineNo, sideText, marker, ok := sideContent(row, side)
+	if !ok {
+		return []string{prefix + strings.Repeat(" ", lineWidth)}
+	}
+
+	num := ""
+	if lineNo != nil {
+		num = fmt.Sprintf("%d", *lineNo)
+	}
+	meta := fmt.Sprintf("%c %*s ", marker, numW, num)
+	metaWidth := len([]rune(meta))
+	textWidth := maxInt(1, lineWidth-metaWidth)
+
+	plainText := normalizeDisplayText(sideText)
+	chunks := wrapRunesWithOffsets(plainText, textWidth)
+	if len(chunks) == 0 {
+		chunks = []wrappedChunk{{text: "", start: 0}}
+	}
+
+	baseStyle, highlightStyle := stylesForContent(row.Kind, side)
+	if isCursor {
+		baseStyle = baseStyle.Background(cursorRowBg)
+	}
+	changed := highlightRanges(row, side)
+
+	out := make([]string, 0, len(chunks))
+	firstStyled := styleChunk(chunks[0].text, chunks[0].start, changed, baseStyle, highlightStyle)
+	metaStyled := styleMeta(meta, row.Kind, side, isCursor)
+	out = append(out, prefix+metaStyled+firstStyled+strings.Repeat(" ", textWidth-len([]rune(chunks[0].text))))
+
+	contMeta := strings.Repeat(" ", metaWidth)
+	for _, chunk := range chunks[1:] {
+		styled := styleChunk(chunk.text, chunk.start, changed, baseStyle, highlightStyle)
+		out = append(out, contPrefix+contMeta+styled+strings.Repeat(" ", textWidth-len([]rune(chunk.text))))
+	}
+
+	return out
+}
+
+func renderGutterPrefix(isCursor, hasComment bool) string {
+	cursorMark := " "
+	if isCursor {
+		cursorMark = ">"
+	}
+	commentMark := " "
+	if hasComment {
+		commentMark = "C"
+	}
+	marks := cursorMark + commentMark
+
+	switch {
+	case isCursor && hasComment:
+		return cursorCommentGutterStyle.Render(marks) + " "
+	case isCursor:
+		return cursorGutterStyle.Render(marks) + " "
+	case hasComment:
+		return commentGutterStyle.Render(marks) + " "
+	default:
+		return marks + " "
+	}
+}
+
+func styleMeta(meta string, kind RowKind, side Side, isCursor bool) string {
+	base, _ := stylesForContent(kind, side)
+	metaStyle := base.Bold(isCursor)
+	if isCursor {
+		metaStyle = metaStyle.Foreground(lipgloss.Color("230")).Background(cursorRowBg)
+	}
+	return metaStyle.Render(meta)
+}
+
+func stylesForContent(kind RowKind, side Side) (lipgloss.Style, lipgloss.Style) {
+	switch kind {
+	case RowAdd:
+		return addBaseStyle, addWordStyle
+	case RowDelete:
+		return deleteBaseStyle, deleteWordStyle
+	case RowChange:
+		if side == SideOld {
+			return changeOldBaseStyle, deleteWordStyle
+		}
+		return changeNewBaseStyle, addWordStyle
+	default:
+		return contextBaseStyle, contextBaseStyle
+	}
+}
+
+func highlightRanges(row DiffRow, side Side) []textRange {
+	if row.Kind != RowChange {
+		return nil
+	}
+	oldText := normalizeDisplayText(row.OldText)
+	newText := normalizeDisplayText(row.NewText)
+	oldRanges, newRanges := changedWordRanges(oldText, newText)
+	if side == SideOld {
+		return oldRanges
+	}
+	return newRanges
+}
+
+func styleChunk(text string, chunkStart int, ranges []textRange, baseStyle, highlightStyle lipgloss.Style) string {
+	if text == "" {
+		return ""
+	}
+	if len(ranges) == 0 {
+		return baseStyle.Render(text)
+	}
+
+	runes := []rune(text)
+	var b strings.Builder
+	start := 0
+	inHighlight := inRanges(chunkStart, ranges)
+	for i := 1; i <= len(runes); i++ {
+		if i == len(runes) || inRanges(chunkStart+i, ranges) != inHighlight {
+			seg := string(runes[start:i])
+			if inHighlight {
+				b.WriteString(highlightStyle.Render(seg))
+			} else {
+				b.WriteString(baseStyle.Render(seg))
+			}
+			start = i
+			if i < len(runes) {
+				inHighlight = !inHighlight
+			}
+		}
+	}
+	return b.String()
+}
+
+func inRanges(pos int, ranges []textRange) bool {
+	for _, r := range ranges {
+		if pos >= r.start && pos < r.end {
+			return true
+		}
+	}
+	return false
+}
+
+func changedWordRanges(oldText, newText string) ([]textRange, []textRange) {
+	oldTokens := tokenizeWords(oldText)
+	newTokens := tokenizeWords(newText)
+
+	oldWords, oldWordTokenIdx := extractWords(oldTokens)
+	newWords, newWordTokenIdx := extractWords(newTokens)
+
+	matchedOld, matchedNew := lcsMatches(oldWords, newWords)
+
+	oldRanges := make([]textRange, 0)
+	for wordIdx, tokIdx := range oldWordTokenIdx {
+		if matchedOld[wordIdx] {
+			continue
+		}
+		tok := oldTokens[tokIdx]
+		oldRanges = append(oldRanges, textRange{start: tok.start, end: tok.end})
+	}
+
+	newRanges := make([]textRange, 0)
+	for wordIdx, tokIdx := range newWordTokenIdx {
+		if matchedNew[wordIdx] {
+			continue
+		}
+		tok := newTokens[tokIdx]
+		newRanges = append(newRanges, textRange{start: tok.start, end: tok.end})
+	}
+
+	return mergeRanges(oldRanges), mergeRanges(newRanges)
+}
+
+func tokenizeWords(s string) []token {
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return nil
+	}
+
+	tokens := make([]token, 0, len(runes)/2)
+	start := 0
+	currentSpace := unicode.IsSpace(runes[0])
+	for i := 1; i < len(runes); i++ {
+		isSpace := unicode.IsSpace(runes[i])
+		if isSpace == currentSpace {
+			continue
+		}
+		tokens = append(tokens, token{text: string(runes[start:i]), isSpace: currentSpace, start: start, end: i})
+		start = i
+		currentSpace = isSpace
+	}
+	tokens = append(tokens, token{text: string(runes[start:]), isSpace: currentSpace, start: start, end: len(runes)})
+	return tokens
+}
+
+func extractWords(tokens []token) ([]string, []int) {
+	words := make([]string, 0, len(tokens))
+	indices := make([]int, 0, len(tokens))
+	for i, tok := range tokens {
+		if tok.isSpace {
+			continue
+		}
+		words = append(words, tok.text)
+		indices = append(indices, i)
+	}
+	return words, indices
+}
+
+func lcsMatches(a, b []string) (map[int]bool, map[int]bool) {
+	n := len(a)
+	m := len(b)
+	dp := make([][]int, n+1)
+	for i := range dp {
+		dp[i] = make([]int, m+1)
+	}
+
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			if a[i] == b[j] {
+				dp[i][j] = dp[i+1][j+1] + 1
+			} else if dp[i+1][j] >= dp[i][j+1] {
+				dp[i][j] = dp[i+1][j]
+			} else {
+				dp[i][j] = dp[i][j+1]
+			}
+		}
+	}
+
+	matchedA := make(map[int]bool)
+	matchedB := make(map[int]bool)
+	i, j := 0, 0
+	for i < n && j < m {
+		if a[i] == b[j] {
+			matchedA[i] = true
+			matchedB[j] = true
+			i++
+			j++
+			continue
+		}
+		if dp[i+1][j] >= dp[i][j+1] {
+			i++
+		} else {
+			j++
+		}
+	}
+
+	return matchedA, matchedB
+}
+
+func mergeRanges(in []textRange) []textRange {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]textRange, 0, len(in))
+	cur := in[0]
+	for _, r := range in[1:] {
+		if r.start <= cur.end {
+			if r.end > cur.end {
+				cur.end = r.end
+			}
+			continue
+		}
+		out = append(out, cur)
+		cur = r
+	}
+	out = append(out, cur)
+	return out
 }
 
 func sideContent(row DiffRow, side Side) (*int, string, rune, bool) {
@@ -167,16 +442,15 @@ func sideContent(row DiffRow, side Side) (*int, string, rune, bool) {
 	return nil, "", ' ', false
 }
 
-func hasCommentOnSide(row DiffRow, side Side, hasComment func(path string, line int, side Side) bool) bool {
+func hasCommentOnAnySide(row DiffRow, hasComment func(path string, line int, side Side) bool) bool {
 	if hasComment == nil {
 		return false
 	}
-
-	if side == SideOld && row.OldLine != nil {
-		return hasComment(row.Path, *row.OldLine, SideOld)
+	if row.OldLine != nil && hasComment(row.Path, *row.OldLine, SideOld) {
+		return true
 	}
-	if side == SideNew && row.NewLine != nil {
-		return hasComment(row.Path, *row.NewLine, SideNew)
+	if row.NewLine != nil && hasComment(row.Path, *row.NewLine, SideNew) {
+		return true
 	}
 	return false
 }
@@ -205,20 +479,23 @@ func expandTabs(s string, tabSize int) string {
 	return b.String()
 }
 
-func wrapRunes(s string, width int) []string {
+func wrapRunesWithOffsets(s string, width int) []wrappedChunk {
 	if width <= 0 {
-		return []string{""}
+		return []wrappedChunk{{text: "", start: 0}}
 	}
 	runes := []rune(s)
 	if len(runes) == 0 {
-		return []string{""}
+		return []wrappedChunk{{text: "", start: 0}}
 	}
-	out := make([]string, 0, len(runes)/width+1)
-	for len(runes) > width {
-		out = append(out, string(runes[:width]))
-		runes = runes[width:]
+
+	out := make([]wrappedChunk, 0, len(runes)/width+1)
+	for start := 0; start < len(runes); start += width {
+		end := start + width
+		if end > len(runes) {
+			end = len(runes)
+		}
+		out = append(out, wrappedChunk{text: string(runes[start:end]), start: start})
 	}
-	out = append(out, string(runes))
 	return out
 }
 
@@ -231,14 +508,6 @@ func padSegments(segs []string, width, height int) []string {
 		segs = append(segs, line)
 	}
 	return segs
-}
-
-func padRight(s string, width int) string {
-	runes := []rune(s)
-	if len(runes) >= width {
-		return s
-	}
-	return s + strings.Repeat(" ", width-len(runes))
 }
 
 func digits(n int) int {

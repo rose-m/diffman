@@ -1,6 +1,6 @@
 package app
 
-func paneWidths(totalWidth int) (int, int) {
+func paneWidths(totalWidth int, desiredLeft int) (int, int) {
 	// Widths returned here are content widths, not outer widths.
 	// Border overhead:
 	//   files pane => 2 (left+right)
@@ -10,13 +10,18 @@ func paneWidths(totalWidth int) (int, int) {
 	if available < 2 {
 		return 1, 1
 	}
-	left := available / 3
+
+	left := desiredLeft
 	if left < 1 {
 		left = 1
+	}
+	if left > available-1 {
+		left = available - 1
 	}
 	right := available - left
 	if right < 1 {
 		right = 1
+		left = available - right
 	}
 	return left, right
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"lediff/internal/clipboard"
 	"lediff/internal/comments"
@@ -24,6 +25,11 @@ type focusPane int
 const (
 	focusFiles focusPane = iota
 	focusDiff
+)
+
+const (
+	filePaneWidthDefault = 40
+	filePaneWidthWide    = 120
 )
 
 type filesLoadedMsg struct {
@@ -65,6 +71,7 @@ type Model struct {
 	fileItems []gitint.FileItem
 	selected  int
 	selectedF string
+	filePaneW int
 
 	diffRows   []diffview.DiffRow
 	diffCursor int
@@ -81,9 +88,10 @@ type Model struct {
 	comments           map[string]comments.Comment
 	commentInputActive bool
 	commentInput       string
+	commentInputErr    string
 	commentEditAnchor  *commentAnchor
 
-	statusMsg string
+	alertMsg string
 
 	loadingFiles bool
 	loadingDiff  bool
@@ -116,6 +124,7 @@ func NewModel() (Model, error) {
 		statusSvc:    gitint.NewStatusService(),
 		diffSvc:      gitint.NewDiffService(),
 		helpOpen:     false,
+		filePaneW:    filePaneWidthDefault,
 		commentStore: store,
 		comments:     commentMap,
 		diffDirty:    true,
@@ -123,7 +132,7 @@ func NewModel() (Model, error) {
 		newWidth:     -1,
 	}
 	if loadErr != nil {
-		m.statusMsg = fmt.Sprintf("failed to load comments: %v", loadErr)
+		m.alertMsg = fmt.Sprintf("failed to load comments: %v", loadErr)
 	}
 
 	m.oldView = viewport.New(1, 1)
@@ -206,15 +215,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case clipboardResultMsg:
 		if msg.err != nil {
-			m.statusMsg = fmt.Sprintf("export failed: %v", msg.err)
+			m.alertMsg = fmt.Sprintf("export failed: %v", msg.err)
 			return m, nil
 		}
-		m.statusMsg = "Copied comments export to clipboard."
+		m.alertMsg = "Copied comments export to clipboard."
 		return m, nil
 
 	case tea.KeyMsg:
 		if m.commentInputActive {
 			return m.handleCommentInput(msg)
+		}
+		if m.alertMsg != "" {
+			m.alertMsg = ""
+			return m, nil
 		}
 
 		if key.Matches(msg, m.keys.Quit) {
@@ -242,12 +255,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if key.Matches(msg, m.keys.Refresh) {
 			m.loadingFiles = true
-			m.statusMsg = ""
 			return m, m.loadFilesCmd()
 		}
 		if key.Matches(msg, m.keys.ToggleMode) {
 			m.advanceDiffMode()
-			m.statusMsg = fmt.Sprintf("Diff mode: %s", m.diffMode.String())
 			if m.selectedF != "" {
 				m.loadingDiff = true
 				return m, m.loadDiffCmd(m.selectedF)
@@ -265,6 +276,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, m.keys.ToggleFiles) {
+		if m.filePaneW == filePaneWidthWide {
+			m.filePaneW = filePaneWidthDefault
+		} else {
+			m.filePaneW = filePaneWidthWide
+		}
+		m.diffDirty = true
+		m.resizePanes()
+		return m, nil
+	}
+
 	if len(m.fileItems) == 0 {
 		return m, nil
 	}
@@ -278,7 +300,6 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.selectedF = m.fileItems[m.selected].Path
 		if m.selected != prev {
 			m.loadingDiff = true
-			m.statusMsg = ""
 			return m, m.loadDiffCmd(m.selectedF)
 		}
 		return m, nil
@@ -291,7 +312,6 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.selectedF = m.fileItems[m.selected].Path
 		if m.selected != prev {
 			m.loadingDiff = true
-			m.statusMsg = ""
 			return m, m.loadDiffCmd(m.selectedF)
 		}
 		return m, nil
@@ -299,8 +319,9 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Open):
 		m.selectedF = m.fileItems[m.selected].Path
 		m.loadingDiff = true
-		m.statusMsg = ""
+		m.focus = focusDiff
 		return m, m.loadDiffCmd(m.selectedF)
+
 	}
 
 	return m, nil
@@ -354,10 +375,9 @@ func (m Model) updateDiffPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keys.Export):
 		if len(m.comments) == 0 {
-			m.statusMsg = "No comments to export."
+			m.alertMsg = "No comments to export."
 			return m, nil
 		}
-		m.statusMsg = "Copying comments export to clipboard..."
 		return m, m.exportCommentsCmd()
 	}
 	return m, nil
@@ -368,8 +388,9 @@ func (m Model) handleCommentInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEsc:
 		m.commentInputActive = false
 		m.commentInput = ""
+		m.commentInputErr = ""
 		m.commentEditAnchor = nil
-		m.statusMsg = "Comment canceled."
+		m.alertMsg = "Comment canceled."
 		return m, nil
 
 	case tea.KeyEnter:
@@ -378,14 +399,17 @@ func (m Model) handleCommentInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyBackspace, tea.KeyCtrlH:
 		m.commentInput = removeLastRune(m.commentInput)
+		m.commentInputErr = ""
 		return m, nil
 
 	case tea.KeySpace:
 		m.commentInput += " "
+		m.commentInputErr = ""
 		return m, nil
 
 	case tea.KeyRunes:
 		m.commentInput += msg.String()
+		m.commentInputErr = ""
 		return m, nil
 	}
 
@@ -396,12 +420,13 @@ func (m *Model) saveCommentInput() {
 	if m.commentEditAnchor == nil {
 		m.commentInputActive = false
 		m.commentInput = ""
+		m.commentInputErr = ""
 		return
 	}
 
 	body := strings.TrimSpace(m.commentInput)
 	if body == "" {
-		m.statusMsg = "Comment text is empty."
+		m.commentInputErr = "Comment text is empty."
 		return
 	}
 
@@ -426,14 +451,15 @@ func (m *Model) saveCommentInput() {
 	}
 
 	if err := m.persistComments(); err != nil {
-		m.statusMsg = fmt.Sprintf("failed to save comments: %v", err)
+		m.alertMsg = fmt.Sprintf("failed to save comments: %v", err)
 		return
 	}
 
 	m.commentInputActive = false
 	m.commentInput = ""
+	m.commentInputErr = ""
 	m.commentEditAnchor = nil
-	m.statusMsg = fmt.Sprintf("Saved comment on %s:%d.", anchor.Path, anchor.Line)
+	m.alertMsg = fmt.Sprintf("Saved comment on %s:%d.", anchor.Path, anchor.Line)
 	m.diffDirty = true
 	m.refreshDiffContent()
 }
@@ -441,51 +467,47 @@ func (m *Model) saveCommentInput() {
 func (m *Model) startCommentEdit(requireExisting bool) {
 	anchor, ok := m.currentAnchor()
 	if !ok {
-		m.statusMsg = "No commentable line selected."
+		m.alertMsg = "No commentable line selected."
 		return
 	}
 
 	key := comments.AnchorKey(anchor.Path, anchor.Side, anchor.Line)
 	existing, exists := m.comments[key]
 	if requireExisting && !exists {
-		m.statusMsg = "No comment exists on selected line."
+		m.alertMsg = "No comment exists on selected line."
 		return
 	}
 
 	m.commentInputActive = true
 	m.commentInput = ""
+	m.commentInputErr = ""
 	if exists {
 		m.commentInput = existing.Body
 	}
 	a := anchor
 	m.commentEditAnchor = &a
-	if exists {
-		m.statusMsg = "Editing comment. Enter saves; Esc cancels."
-	} else {
-		m.statusMsg = "Creating comment. Enter saves; Esc cancels."
-	}
 }
 
 func (m *Model) deleteCommentAtCursor() {
 	anchor, ok := m.currentAnchor()
 	if !ok {
-		m.statusMsg = "No commentable line selected."
+		m.alertMsg = "No commentable line selected."
 		return
 	}
 
 	key := comments.AnchorKey(anchor.Path, anchor.Side, anchor.Line)
 	if _, exists := m.comments[key]; !exists {
-		m.statusMsg = "No comment exists on selected line."
+		m.alertMsg = "No comment exists on selected line."
 		return
 	}
 	delete(m.comments, key)
 
 	if err := m.persistComments(); err != nil {
-		m.statusMsg = fmt.Sprintf("failed to save comments: %v", err)
+		m.alertMsg = fmt.Sprintf("failed to save comments: %v", err)
 		return
 	}
 
-	m.statusMsg = fmt.Sprintf("Deleted comment on %s:%d.", anchor.Path, anchor.Line)
+	m.alertMsg = fmt.Sprintf("Deleted comment on %s:%d.", anchor.Path, anchor.Line)
 	m.diffDirty = true
 	m.refreshDiffContent()
 }
@@ -493,7 +515,7 @@ func (m *Model) deleteCommentAtCursor() {
 func (m *Model) jumpToComment(direction int) {
 	rows := m.commentRowIndices()
 	if len(rows) == 0 {
-		m.statusMsg = "No comments in current diff."
+		m.alertMsg = "No comments in current diff."
 		return
 	}
 
@@ -526,34 +548,20 @@ func (m Model) View() string {
 		return "Loading..."
 	}
 
-	help := "tab focus | h/l focus panes | j/k move | enter open diff | t mode | c/e/d comment | n/p comment nav | y export | r refresh | ? help | q quit"
+	help := "tab focus | h/l focus panes | j/k move | enter open diff | z file width | t mode | c/e/d comment | n/p comment nav | y export | r refresh | ? help | q quit"
 	if m.helpOpen {
 		help = strings.Join([]string{
 			"Global: q quit, tab switch focus, h files focus, l diff focus, t toggle diff mode, ? toggle help",
-			"Files pane: j/k move, enter open diff, r refresh",
+			"Files pane: j/k move, enter open diff, z toggle file pane width, r refresh",
 			"Diff pane: j/k move cursor, g/G top/bottom",
 			"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard",
 		}, "\n")
 	}
 
-	footerLines := make([]string, 0, 6)
-	if m.commentInputActive {
-		anchor := "selected line"
-		if m.commentEditAnchor != nil {
-			anchor = fmt.Sprintf("%s %s:%d", m.commentEditAnchor.Path, m.commentEditAnchor.Side.String(), m.commentEditAnchor.Line)
-		}
-		footerLines = append(footerLines, fmt.Sprintf("Comment for %s: %s", anchor, m.commentInput))
-		footerLines = append(footerLines, "Enter save | Esc cancel | Backspace delete")
-	}
-	if m.statusMsg != "" {
-		footerLines = append(footerLines, m.statusMsg)
-	}
-	footerLines = append(footerLines, strings.Split(help, "\n")...)
-
-	footer := truncateLinesToWidth(strings.Join(footerLines, "\n"), m.width)
+	footer := truncateLinesToWidth(help, m.width)
 	footerHeight := lineCount(footer)
 
-	leftW, rightW := paneWidths(m.width)
+	leftW, rightW := paneWidths(m.width, m.filePaneW)
 	oldPaneW, newPaneW := splitRightPanes(rightW)
 	// lipgloss Height applies to content height; borders add 2 more rows.
 	paneContentHeight := max(1, m.height-footerHeight-2)
@@ -571,8 +579,175 @@ func (m Model) View() string {
 	leftPane := m.renderFilesPane(leftW, paneContentHeight)
 	rightPane := m.renderDiffPanes(oldPaneW, newPaneW, paneContentHeight)
 	content := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
+	contentAreaHeight := paneContentHeight + 2
+	if m.commentInputActive {
+		content = overlayCentered(content, m.renderCommentModal(), m.width, contentAreaHeight)
+	} else if m.alertMsg != "" {
+		content = overlayCentered(content, m.renderAlertModal(), m.width, contentAreaHeight)
+	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, content, footer)
+}
+
+func (m Model) renderCommentModal() string {
+	title := "New Comment"
+	if m.commentEditAnchor != nil {
+		key := comments.AnchorKey(m.commentEditAnchor.Path, m.commentEditAnchor.Side, m.commentEditAnchor.Line)
+		if _, exists := m.comments[key]; exists {
+			title = "Edit Comment"
+		}
+	}
+
+	anchor := "selected line"
+	if m.commentEditAnchor != nil {
+		anchor = fmt.Sprintf("%s %s:%d", m.commentEditAnchor.Path, m.commentEditAnchor.Side.String(), m.commentEditAnchor.Line)
+	}
+
+	bodyLines := []string{
+		title,
+		"",
+		"Target: " + anchor,
+		"",
+		"Comment:",
+		m.renderCommentInputLine(),
+		"",
+		"Enter save | Esc cancel | Backspace delete",
+	}
+	if m.commentInputErr != "" {
+		bodyLines = append(bodyLines, "")
+		bodyLines = append(bodyLines, "Error: "+m.commentInputErr)
+	}
+
+	modalW := m.modalWidth()
+	body := strings.Join(bodyLines, "\n")
+	return lipgloss.NewStyle().
+		Width(modalW).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("39")).
+		Background(lipgloss.Color("235")).
+		Padding(1, 2).
+		Render(body)
+}
+
+func (m Model) renderAlertModal() string {
+	modalW := m.modalWidth()
+	body := strings.Join([]string{
+		"Notice",
+		"",
+		m.alertMsg,
+		"",
+		"Press any key to dismiss",
+	}, "\n")
+	return lipgloss.NewStyle().
+		Width(modalW).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("220")).
+		Background(lipgloss.Color("235")).
+		Padding(1, 2).
+		Render(body)
+}
+
+func (m Model) renderCommentInputLine() string {
+	cursor := lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("51")).Render(" ")
+	if m.commentInput == "" {
+		placeholder := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("(type comment)")
+		return placeholder + cursor
+	}
+	return m.commentInput + cursor
+}
+
+func (m Model) modalWidth() int {
+	w := m.width - 8
+	if w > 100 {
+		w = 100
+	}
+	if w < 30 {
+		w = m.width - 2
+	}
+	if w < 10 {
+		w = 10
+	}
+	return w
+}
+
+func overlayCentered(base, overlay string, width, height int) string {
+	baseLines := normalizeCanvas(base, width, height)
+	overlayLines := strings.Split(overlay, "\n")
+	overlayW := lipgloss.Width(overlay)
+	overlayH := len(overlayLines)
+	if overlayW <= 0 || overlayH <= 0 {
+		return strings.Join(baseLines, "\n")
+	}
+
+	x := max(0, (width-overlayW)/2)
+	y := max(0, (height-overlayH)/2)
+	for i, ol := range overlayLines {
+		row := y + i
+		if row < 0 || row >= len(baseLines) {
+			continue
+		}
+		baseLines[row] = overlayLine(baseLines[row], ol, x, overlayW, width)
+	}
+	return strings.Join(baseLines, "\n")
+}
+
+func normalizeCanvas(s string, width, height int) []string {
+	if width < 1 {
+		width = 1
+	}
+	if height < 1 {
+		height = 1
+	}
+
+	raw := strings.Split(s, "\n")
+	lines := make([]string, 0, height)
+	for i := 0; i < height; i++ {
+		line := ""
+		if i < len(raw) {
+			line = raw[i]
+		}
+		w := lipgloss.Width(line)
+		switch {
+		case w > width:
+			lines = append(lines, ansi.Truncate(line, width, ""))
+		case w < width:
+			lines = append(lines, line+strings.Repeat(" ", width-w))
+		default:
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func overlayLine(baseLine, overlayLine string, x, overlayW, totalW int) string {
+	if overlayW <= 0 {
+		return baseLine
+	}
+	if x < 0 {
+		x = 0
+	}
+	if x >= totalW {
+		return baseLine
+	}
+	if x+overlayW > totalW {
+		overlayLine = ansi.Truncate(overlayLine, totalW-x, "")
+		overlayW = lipgloss.Width(overlayLine)
+		if overlayW <= 0 {
+			return baseLine
+		}
+	}
+
+	plain := []rune(ansi.Strip(baseLine))
+	if len(plain) < totalW {
+		plain = append(plain, []rune(strings.Repeat(" ", totalW-len(plain)))...)
+	}
+	left := string(plain[:x])
+	rightStart := x + overlayW
+	if rightStart > len(plain) {
+		rightStart = len(plain)
+	}
+	right := string(plain[rightStart:])
+	return left + overlayLine + right
 }
 
 func (m Model) renderFilesPane(width, height int) string {
@@ -658,7 +833,7 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string, wit
 }
 
 func (m *Model) resizePanes() {
-	_, rightW := paneWidths(m.width)
+	_, rightW := paneWidths(m.width, m.filePaneW)
 	oldPaneW, newPaneW := splitRightPanes(rightW)
 	m.oldView.Width = max(1, oldPaneW)
 	m.newView.Width = max(1, newPaneW)
