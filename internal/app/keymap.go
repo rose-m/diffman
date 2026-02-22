@@ -13,6 +13,12 @@ type KeyMap struct {
 	Top         key.Binding
 	Bottom      key.Binding
 	Help        key.Binding
+	Create      key.Binding
+	Edit        key.Binding
+	Delete      key.Binding
+	NextComment key.Binding
+	PrevComment key.Binding
+	Export      key.Binding
 }
 
 func defaultKeyMap() KeyMap {
@@ -26,5 +32,11 @@ func defaultKeyMap() KeyMap {
 		Top:         key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "top")),
 		Bottom:      key.NewBinding(key.WithKeys("G"), key.WithHelp("G", "bottom")),
 		Help:        key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+		Create:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "new comment")),
+		Edit:        key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit comment")),
+		Delete:      key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "delete comment")),
+		NextComment: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next comment")),
+		PrevComment: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "prev comment")),
+		Export:      key.NewBinding(key.WithKeys("y"), key.WithHelp("y", "copy export")),
 	}
 }

@@ -4,13 +4,18 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"lediff/internal/clipboard"
+	"lediff/internal/comments"
+	"lediff/internal/diffview"
 	gitint "lediff/internal/git"
 )
 
@@ -27,9 +32,21 @@ type filesLoadedMsg struct {
 }
 
 type diffLoadedMsg struct {
-	path string
-	diff string
-	err  error
+	path  string
+	rows  []diffview.DiffRow
+	empty bool
+	err   error
+}
+
+type clipboardResultMsg struct {
+	err error
+}
+
+type commentAnchor struct {
+	Path   string
+	Side   comments.Side
+	Line   int
+	RowIdx int
 }
 
 // Model is the Bubble Tea state container for the app.
@@ -37,6 +54,8 @@ type Model struct {
 	keys      KeyMap
 	focus     focusPane
 	cwd       string
+	repoRoot  string
+	gitDir    string
 	statusSvc gitint.StatusService
 	diffSvc   gitint.DiffService
 
@@ -48,8 +67,18 @@ type Model struct {
 	selected  int
 	selectedF string
 
-	diffView viewport.Model
-	helpOpen bool
+	diffRows   []diffview.DiffRow
+	diffCursor int
+	diffView   viewport.Model
+	helpOpen   bool
+
+	commentStore       comments.Store
+	comments           map[string]comments.Comment
+	commentInputActive bool
+	commentInput       string
+	commentEditAnchor  *commentAnchor
+
+	statusMsg string
 
 	loadingFiles bool
 	loadingDiff  bool
@@ -62,14 +91,38 @@ func NewModel() (Model, error) {
 		return Model{}, err
 	}
 
-	m := Model{
-		keys:      defaultKeyMap(),
-		focus:     focusFiles,
-		cwd:       cwd,
-		statusSvc: gitint.NewStatusService(),
-		diffSvc:   gitint.NewDiffService(),
-		helpOpen:  false,
+	repoRoot, err := gitint.DiscoverRepoRoot(context.Background(), cwd)
+	if err != nil {
+		return Model{}, err
 	}
+	gitDir, err := gitint.DiscoverGitDir(context.Background(), cwd)
+	if err != nil {
+		return Model{}, err
+	}
+
+	store := comments.NewStore(gitDir)
+	loadedComments, loadErr := store.Load()
+	commentMap := make(map[string]comments.Comment, len(loadedComments))
+	for _, c := range loadedComments {
+		commentMap[comments.AnchorKey(c.Path, c.Side, c.Line)] = c
+	}
+
+	m := Model{
+		keys:         defaultKeyMap(),
+		focus:        focusFiles,
+		cwd:          cwd,
+		repoRoot:     repoRoot,
+		gitDir:       gitDir,
+		statusSvc:    gitint.NewStatusService(),
+		diffSvc:      gitint.NewDiffService(),
+		helpOpen:     false,
+		commentStore: store,
+		comments:     commentMap,
+	}
+	if loadErr != nil {
+		m.statusMsg = fmt.Sprintf("failed to load comments: %v", loadErr)
+	}
+
 	m.diffView = viewport.New(1, 1)
 	m.diffView.SetContent("Select a file to load its diff.")
 	return m, nil
@@ -87,6 +140,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ready = true
 		m.resizePanes()
+		m.refreshDiffContent()
 		return m, nil
 
 	case filesLoadedMsg:
@@ -96,6 +150,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.fileItems) == 0 {
 			m.selected = 0
 			m.selectedF = ""
+			m.diffRows = nil
+			m.diffCursor = 0
 			m.diffView.GotoTop()
 			m.diffView.SetContent("No changed files found in this repository.")
 			return m, nil
@@ -111,18 +167,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadingDiff = false
 		m.err = msg.err
 		if msg.err != nil {
+			m.diffRows = nil
 			m.diffView.SetContent(fmt.Sprintf("Failed to load diff for %s:\n%v", msg.path, msg.err))
 			return m, nil
 		}
-		if strings.TrimSpace(msg.diff) == "" {
+		if msg.empty || len(msg.rows) == 0 {
+			m.diffRows = nil
+			m.diffCursor = 0
 			m.diffView.SetContent(fmt.Sprintf("No diff for %s.", msg.path))
 			return m, nil
 		}
-		m.diffView.GotoTop()
-		m.diffView.SetContent(msg.diff)
+		m.diffRows = msg.rows
+		m.diffCursor = firstRenderableRow(m.diffRows)
+		m.refreshDiffContent()
+		return m, nil
+
+	case clipboardResultMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("export failed: %v", msg.err)
+			return m, nil
+		}
+		m.statusMsg = "Copied comments export to clipboard."
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.commentInputActive {
+			return m.handleCommentInput(msg)
+		}
+
 		if key.Matches(msg, m.keys.Quit) {
 			return m, tea.Quit
 		}
@@ -140,6 +212,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if key.Matches(msg, m.keys.Refresh) {
 			m.loadingFiles = true
+			m.statusMsg = ""
 			return m, m.loadFilesCmd()
 		}
 
@@ -149,11 +222,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateDiffPane(msg)
 	}
 
-	if m.focus == focusDiff {
-		var cmd tea.Cmd
-		m.diffView, cmd = m.diffView.Update(msg)
-		return m, cmd
-	}
 	return m, nil
 }
 
@@ -180,6 +248,7 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keys.Open):
 		m.selectedF = m.fileItems[m.selected].Path
 		m.loadingDiff = true
+		m.statusMsg = ""
 		return m, m.loadDiffCmd(m.selectedF)
 	}
 
@@ -187,21 +256,213 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateDiffPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch {
-	case key.Matches(msg, m.keys.Up):
-		m.diffView.LineUp(1)
-		return m, nil
-	case key.Matches(msg, m.keys.Down):
-		m.diffView.LineDown(1)
-		return m, nil
-	case key.Matches(msg, m.keys.Top):
-		m.diffView.GotoTop()
-		return m, nil
-	case key.Matches(msg, m.keys.Bottom):
-		m.diffView.GotoBottom()
+	if len(m.diffRows) == 0 {
 		return m, nil
 	}
+
+	switch {
+	case key.Matches(msg, m.keys.Up):
+		m.moveDiffCursor(-1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Down):
+		m.moveDiffCursor(1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Top):
+		m.diffCursor = 0
+		m.refreshDiffContent()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Bottom):
+		m.diffCursor = len(m.diffRows) - 1
+		m.refreshDiffContent()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Create):
+		m.startCommentEdit(false)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Edit):
+		m.startCommentEdit(true)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Delete):
+		m.deleteCommentAtCursor()
+		return m, nil
+
+	case key.Matches(msg, m.keys.NextComment):
+		m.jumpToComment(1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.PrevComment):
+		m.jumpToComment(-1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Export):
+		if len(m.comments) == 0 {
+			m.statusMsg = "No comments to export."
+			return m, nil
+		}
+		m.statusMsg = "Copying comments export to clipboard..."
+		return m, m.exportCommentsCmd()
+	}
 	return m, nil
+}
+
+func (m Model) handleCommentInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.commentInputActive = false
+		m.commentInput = ""
+		m.commentEditAnchor = nil
+		m.statusMsg = "Comment canceled."
+		return m, nil
+
+	case tea.KeyEnter:
+		m.saveCommentInput()
+		return m, nil
+
+	case tea.KeyBackspace, tea.KeyCtrlH:
+		m.commentInput = removeLastRune(m.commentInput)
+		return m, nil
+
+	case tea.KeySpace:
+		m.commentInput += " "
+		return m, nil
+
+	case tea.KeyRunes:
+		m.commentInput += msg.String()
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func (m *Model) saveCommentInput() {
+	if m.commentEditAnchor == nil {
+		m.commentInputActive = false
+		m.commentInput = ""
+		return
+	}
+
+	body := strings.TrimSpace(m.commentInput)
+	if body == "" {
+		m.statusMsg = "Comment text is empty."
+		return
+	}
+
+	anchor := *m.commentEditAnchor
+	key := comments.AnchorKey(anchor.Path, anchor.Side, anchor.Line)
+	existing, exists := m.comments[key]
+	createdAt := time.Now()
+	if exists {
+		createdAt = existing.CreatedAt
+	}
+
+	contextBefore, contextAfter := m.contextAround(anchor)
+	m.comments[key] = comments.Comment{
+		Path:          anchor.Path,
+		Side:          anchor.Side,
+		Line:          anchor.Line,
+		Body:          body,
+		CreatedAt:     createdAt,
+		HunkHeader:    m.hunkHeaderForRow(anchor.RowIdx, anchor.Path),
+		ContextBefore: contextBefore,
+		ContextAfter:  contextAfter,
+	}
+
+	if err := m.persistComments(); err != nil {
+		m.statusMsg = fmt.Sprintf("failed to save comments: %v", err)
+		return
+	}
+
+	m.commentInputActive = false
+	m.commentInput = ""
+	m.commentEditAnchor = nil
+	m.statusMsg = fmt.Sprintf("Saved comment on %s:%d.", anchor.Path, anchor.Line)
+	m.refreshDiffContent()
+}
+
+func (m *Model) startCommentEdit(requireExisting bool) {
+	anchor, ok := m.currentAnchor()
+	if !ok {
+		m.statusMsg = "No commentable line selected."
+		return
+	}
+
+	key := comments.AnchorKey(anchor.Path, anchor.Side, anchor.Line)
+	existing, exists := m.comments[key]
+	if requireExisting && !exists {
+		m.statusMsg = "No comment exists on selected line."
+		return
+	}
+
+	m.commentInputActive = true
+	m.commentInput = ""
+	if exists {
+		m.commentInput = existing.Body
+	}
+	a := anchor
+	m.commentEditAnchor = &a
+	if exists {
+		m.statusMsg = "Editing comment. Enter saves; Esc cancels."
+	} else {
+		m.statusMsg = "Creating comment. Enter saves; Esc cancels."
+	}
+}
+
+func (m *Model) deleteCommentAtCursor() {
+	anchor, ok := m.currentAnchor()
+	if !ok {
+		m.statusMsg = "No commentable line selected."
+		return
+	}
+
+	key := comments.AnchorKey(anchor.Path, anchor.Side, anchor.Line)
+	if _, exists := m.comments[key]; !exists {
+		m.statusMsg = "No comment exists on selected line."
+		return
+	}
+	delete(m.comments, key)
+
+	if err := m.persistComments(); err != nil {
+		m.statusMsg = fmt.Sprintf("failed to save comments: %v", err)
+		return
+	}
+
+	m.statusMsg = fmt.Sprintf("Deleted comment on %s:%d.", anchor.Path, anchor.Line)
+	m.refreshDiffContent()
+}
+
+func (m *Model) jumpToComment(direction int) {
+	rows := m.commentRowIndices()
+	if len(rows) == 0 {
+		m.statusMsg = "No comments in current diff."
+		return
+	}
+
+	next := rows[0]
+	if direction < 0 {
+		next = rows[len(rows)-1]
+	}
+	for _, idx := range rows {
+		if direction > 0 && idx > m.diffCursor {
+			next = idx
+			break
+		}
+	}
+	if direction < 0 {
+		for i := len(rows) - 1; i >= 0; i-- {
+			if rows[i] < m.diffCursor {
+				next = rows[i]
+				break
+			}
+		}
+	}
+
+	m.diffCursor = next
+	m.refreshDiffContent()
 }
 
 func (m Model) View() string {
@@ -209,28 +470,45 @@ func (m Model) View() string {
 		return "Loading..."
 	}
 
-	help := "tab focus | j/k move | enter open diff | g/G top/bottom | r refresh | ? help | q quit"
+	help := "tab focus | j/k move | enter open diff | c/e/d comment | n/p comment nav | y export | r refresh | ? help | q quit"
 	if m.helpOpen {
 		help = strings.Join([]string{
 			"Global: q quit, tab switch focus, ? toggle help",
 			"Files pane: j/k move, enter open diff, r refresh",
-			"Diff pane: j/k scroll, g/G top/bottom",
+			"Diff pane: j/k move cursor, g/G top/bottom",
+			"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard",
 		}, "\n")
 	}
-	help = truncateLinesToWidth(help, m.width)
-	helpLines := lineCount(help)
+
+	footerLines := make([]string, 0, 6)
+	if m.commentInputActive {
+		anchor := "selected line"
+		if m.commentEditAnchor != nil {
+			anchor = fmt.Sprintf("%s %s:%d", m.commentEditAnchor.Path, m.commentEditAnchor.Side.String(), m.commentEditAnchor.Line)
+		}
+		footerLines = append(footerLines, fmt.Sprintf("Comment for %s: %s", anchor, m.commentInput))
+		footerLines = append(footerLines, "Enter save | Esc cancel | Backspace delete")
+	}
+	if m.statusMsg != "" {
+		footerLines = append(footerLines, m.statusMsg)
+	}
+	footerLines = append(footerLines, strings.Split(help, "\n")...)
+
+	footer := truncateLinesToWidth(strings.Join(footerLines, "\n"), m.width)
+	footerHeight := lineCount(footer)
 
 	leftW, rightW := paneWidths(m.width)
 	// lipgloss Height applies to content height; borders add 2 more rows.
-	paneContentHeight := max(1, m.height-helpLines-2)
+	paneContentHeight := max(1, m.height-footerHeight-2)
 	m.diffView.Width = max(1, rightW-4)
 	m.diffView.Height = max(1, paneContentHeight-4)
+	m.refreshDiffContent()
 
 	leftPane := m.renderFilesPane(leftW, paneContentHeight)
 	rightPane := m.renderDiffPane(rightW, paneContentHeight)
 	content := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
 
-	return lipgloss.JoinVertical(lipgloss.Left, content, help)
+	return lipgloss.JoinVertical(lipgloss.Left, content, footer)
 }
 
 func (m Model) renderFilesPane(width, height int) string {
@@ -246,7 +524,7 @@ func (m Model) renderFilesPane(width, height int) string {
 		Border(border).
 		BorderForeground(borderColor)
 
-	title := "Files"
+	title := fmt.Sprintf("Files (%d)", len(m.fileItems))
 	if m.loadingFiles {
 		title += " (loading...)"
 	}
@@ -307,9 +585,8 @@ func (m Model) renderDiffPane(width, height int) string {
 
 func (m *Model) resizePanes() {
 	_, rightW := paneWidths(m.width)
-	availableHeight := max(3, m.height-2)
 	m.diffView.Width = max(1, rightW-4)
-	m.diffView.Height = max(1, availableHeight-4)
+	m.diffView.Height = max(1, m.height-6)
 }
 
 func (m Model) loadFilesCmd() tea.Cmd {
@@ -326,8 +603,263 @@ func (m Model) loadDiffCmd(path string) tea.Cmd {
 	service := m.diffSvc
 	return func() tea.Msg {
 		d, err := service.AllChangesDiff(context.Background(), cwd, path)
-		return diffLoadedMsg{path: path, diff: d, err: err}
+		if err != nil {
+			return diffLoadedMsg{path: path, err: err}
+		}
+		if strings.TrimSpace(d) == "" {
+			return diffLoadedMsg{path: path, empty: true}
+		}
+
+		rows, err := diffview.ParseUnifiedDiff([]byte(d))
+		if err != nil {
+			return diffLoadedMsg{path: path, err: err}
+		}
+		return diffLoadedMsg{path: path, rows: rows}
 	}
+}
+
+func (m Model) exportCommentsCmd() tea.Cmd {
+	snapshot := m.sortedComments()
+	return func() tea.Msg {
+		text := comments.ExportPlain(snapshot, "Review comments (all changes):")
+		err := clipboard.CopyText(context.Background(), text)
+		return clipboardResultMsg{err: err}
+	}
+}
+
+func (m *Model) moveDiffCursor(delta int) {
+	if len(m.diffRows) == 0 {
+		m.diffCursor = 0
+		return
+	}
+	m.diffCursor += delta
+	if m.diffCursor < 0 {
+		m.diffCursor = 0
+	}
+	if m.diffCursor >= len(m.diffRows) {
+		m.diffCursor = len(m.diffRows) - 1
+	}
+	m.refreshDiffContent()
+}
+
+func (m *Model) refreshDiffContent() {
+	if len(m.diffRows) == 0 {
+		return
+	}
+	m.clampDiffCursor()
+
+	lines := diffview.RenderSideBySide(m.diffRows, m.diffView.Width, m.diffCursor, func(path string, line int, side diffview.Side) bool {
+		return m.hasComment(path, line, side)
+	})
+	m.diffView.SetContent(strings.Join(lines, "\n"))
+	m.ensureCursorVisible()
+}
+
+func (m *Model) ensureCursorVisible() {
+	if m.diffView.Height <= 0 {
+		return
+	}
+	if m.diffCursor < m.diffView.YOffset {
+		m.diffView.SetYOffset(m.diffCursor)
+		return
+	}
+	bottom := m.diffView.YOffset + m.diffView.Height - 1
+	if m.diffCursor > bottom {
+		m.diffView.SetYOffset(m.diffCursor - m.diffView.Height + 1)
+	}
+}
+
+func (m *Model) clampDiffCursor() {
+	if len(m.diffRows) == 0 {
+		m.diffCursor = 0
+		return
+	}
+	if m.diffCursor < 0 {
+		m.diffCursor = 0
+	}
+	if m.diffCursor >= len(m.diffRows) {
+		m.diffCursor = len(m.diffRows) - 1
+	}
+}
+
+func (m *Model) hasComment(path string, line int, side diffview.Side) bool {
+	commentSide := comments.SideNew
+	if side == diffview.SideOld {
+		commentSide = comments.SideOld
+	}
+	_, ok := m.comments[comments.AnchorKey(path, commentSide, line)]
+	return ok
+}
+
+func (m *Model) currentAnchor() (commentAnchor, bool) {
+	if len(m.diffRows) == 0 || m.diffCursor < 0 || m.diffCursor >= len(m.diffRows) {
+		return commentAnchor{}, false
+	}
+	row := m.diffRows[m.diffCursor]
+	if row.Kind == diffview.RowFileHeader || row.Kind == diffview.RowHunkHeader {
+		return commentAnchor{}, false
+	}
+	if row.Path == "" {
+		return commentAnchor{}, false
+	}
+
+	side, line, ok := pickAnchor(row)
+	if !ok {
+		return commentAnchor{}, false
+	}
+
+	return commentAnchor{Path: row.Path, Side: side, Line: line, RowIdx: m.diffCursor}, true
+}
+
+func (m *Model) commentRowIndices() []int {
+	rows := make([]int, 0)
+	for i, row := range m.diffRows {
+		if row.OldLine != nil && m.hasComment(row.Path, *row.OldLine, diffview.SideOld) {
+			rows = append(rows, i)
+			continue
+		}
+		if row.NewLine != nil && m.hasComment(row.Path, *row.NewLine, diffview.SideNew) {
+			rows = append(rows, i)
+		}
+	}
+	return rows
+}
+
+func (m *Model) persistComments() error {
+	return m.commentStore.Save(m.sortedComments())
+}
+
+func (m Model) sortedComments() []comments.Comment {
+	out := make([]comments.Comment, 0, len(m.comments))
+	for _, c := range m.comments {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Path != out[j].Path {
+			return out[i].Path < out[j].Path
+		}
+		if out[i].Line != out[j].Line {
+			return out[i].Line < out[j].Line
+		}
+		if out[i].Side != out[j].Side {
+			return out[i].Side < out[j].Side
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
+	return out
+}
+
+func (m *Model) contextAround(anchor commentAnchor) ([]string, []string) {
+	target := m.sideText(m.diffRows[anchor.RowIdx], anchor.Side)
+	before := ""
+	after := ""
+
+	for i := anchor.RowIdx - 1; i >= 0; i-- {
+		if m.diffRows[i].Path != anchor.Path {
+			continue
+		}
+		text := m.sideText(m.diffRows[i], anchor.Side)
+		if text != "" {
+			before = text
+			break
+		}
+	}
+
+	for i := anchor.RowIdx + 1; i < len(m.diffRows); i++ {
+		if m.diffRows[i].Path != anchor.Path {
+			continue
+		}
+		text := m.sideText(m.diffRows[i], anchor.Side)
+		if text != "" {
+			after = text
+			break
+		}
+	}
+
+	contextBefore := make([]string, 0, 1)
+	if before != "" {
+		contextBefore = append(contextBefore, before)
+	}
+
+	contextAfter := make([]string, 0, 2)
+	if target != "" {
+		contextAfter = append(contextAfter, target)
+	}
+	if after != "" {
+		contextAfter = append(contextAfter, after)
+	}
+
+	return contextBefore, contextAfter
+}
+
+func (m *Model) sideText(row diffview.DiffRow, side comments.Side) string {
+	if side == comments.SideOld && row.OldLine != nil {
+		return row.OldText
+	}
+	if side == comments.SideNew && row.NewLine != nil {
+		return row.NewText
+	}
+	return ""
+}
+
+func (m *Model) hunkHeaderForRow(rowIdx int, path string) string {
+	for i := rowIdx; i >= 0; i-- {
+		row := m.diffRows[i]
+		if row.Path != path {
+			continue
+		}
+		if row.Kind == diffview.RowHunkHeader {
+			return row.OldText
+		}
+		if row.Kind == diffview.RowFileHeader {
+			break
+		}
+	}
+	return ""
+}
+
+func pickAnchor(row diffview.DiffRow) (comments.Side, int, bool) {
+	switch row.Kind {
+	case diffview.RowDelete:
+		if row.OldLine != nil {
+			return comments.SideOld, *row.OldLine, true
+		}
+	case diffview.RowAdd:
+		if row.NewLine != nil {
+			return comments.SideNew, *row.NewLine, true
+		}
+	default:
+		if row.NewLine != nil {
+			return comments.SideNew, *row.NewLine, true
+		}
+		if row.OldLine != nil {
+			return comments.SideOld, *row.OldLine, true
+		}
+	}
+	return comments.SideNew, 0, false
+}
+
+func firstRenderableRow(rows []diffview.DiffRow) int {
+	if len(rows) == 0 {
+		return 0
+	}
+	for i, row := range rows {
+		if row.Kind != diffview.RowFileHeader && row.Kind != diffview.RowHunkHeader {
+			return i
+		}
+	}
+	return 0
+}
+
+func removeLastRune(s string) string {
+	if s == "" {
+		return s
+	}
+	runes := []rune(s)
+	if len(runes) == 0 {
+		return ""
+	}
+	return string(runes[:len(runes)-1])
 }
 
 func truncateLinesToWidth(text string, width int) string {
