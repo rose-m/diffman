@@ -54,8 +54,7 @@ type Model struct {
 	keys      KeyMap
 	focus     focusPane
 	cwd       string
-	repoRoot  string
-	gitDir    string
+	diffMode  gitint.DiffMode
 	statusSvc gitint.StatusService
 	diffSvc   gitint.DiffService
 
@@ -69,8 +68,12 @@ type Model struct {
 
 	diffRows   []diffview.DiffRow
 	diffCursor int
-	diffView   viewport.Model
+	oldView    viewport.Model
+	newView    viewport.Model
 	helpOpen   bool
+	diffDirty  bool
+	oldWidth   int
+	newWidth   int
 
 	commentStore       comments.Store
 	comments           map[string]comments.Comment
@@ -91,10 +94,6 @@ func NewModel() (Model, error) {
 		return Model{}, err
 	}
 
-	repoRoot, err := gitint.DiscoverRepoRoot(context.Background(), cwd)
-	if err != nil {
-		return Model{}, err
-	}
 	gitDir, err := gitint.DiscoverGitDir(context.Background(), cwd)
 	if err != nil {
 		return Model{}, err
@@ -111,20 +110,24 @@ func NewModel() (Model, error) {
 		keys:         defaultKeyMap(),
 		focus:        focusFiles,
 		cwd:          cwd,
-		repoRoot:     repoRoot,
-		gitDir:       gitDir,
+		diffMode:     gitint.DiffModeAll,
 		statusSvc:    gitint.NewStatusService(),
 		diffSvc:      gitint.NewDiffService(),
 		helpOpen:     false,
 		commentStore: store,
 		comments:     commentMap,
+		diffDirty:    true,
+		oldWidth:     -1,
+		newWidth:     -1,
 	}
 	if loadErr != nil {
 		m.statusMsg = fmt.Sprintf("failed to load comments: %v", loadErr)
 	}
 
-	m.diffView = viewport.New(1, 1)
-	m.diffView.SetContent("Select a file to load its diff.")
+	m.oldView = viewport.New(1, 1)
+	m.newView = viewport.New(1, 1)
+	m.oldView.SetContent("Select a file to load its diff.")
+	m.newView.SetContent("Select a file to load its diff.")
 	return m, nil
 }
 
@@ -140,6 +143,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ready = true
 		m.resizePanes()
+		m.diffDirty = true
 		m.refreshDiffContent()
 		return m, nil
 
@@ -152,8 +156,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selectedF = ""
 			m.diffRows = nil
 			m.diffCursor = 0
-			m.diffView.GotoTop()
-			m.diffView.SetContent("No changed files found in this repository.")
+			m.diffDirty = false
+			m.oldView.GotoTop()
+			m.newView.GotoTop()
+			m.oldView.SetContent("No changed files found in this repository.")
+			m.newView.SetContent("No changed files found in this repository.")
 			return m, nil
 		}
 
@@ -168,17 +175,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 		if msg.err != nil {
 			m.diffRows = nil
-			m.diffView.SetContent(fmt.Sprintf("Failed to load diff for %s:\n%v", msg.path, msg.err))
+			m.diffDirty = false
+			errMsg := fmt.Sprintf("Failed to load diff for %s:\n%v", msg.path, msg.err)
+			m.oldView.SetContent(errMsg)
+			m.newView.SetContent(errMsg)
 			return m, nil
 		}
 		if msg.empty || len(msg.rows) == 0 {
 			m.diffRows = nil
 			m.diffCursor = 0
-			m.diffView.SetContent(fmt.Sprintf("No diff for %s.", msg.path))
+			m.diffDirty = false
+			noDiff := fmt.Sprintf("No diff for %s.", msg.path)
+			m.oldView.SetContent(noDiff)
+			m.newView.SetContent(noDiff)
 			return m, nil
 		}
 		m.diffRows = msg.rows
 		m.diffCursor = firstRenderableRow(m.diffRows)
+		m.diffDirty = true
 		m.refreshDiffContent()
 		return m, nil
 
@@ -214,6 +228,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loadingFiles = true
 			m.statusMsg = ""
 			return m, m.loadFilesCmd()
+		}
+		if key.Matches(msg, m.keys.ToggleMode) {
+			m.advanceDiffMode()
+			m.statusMsg = fmt.Sprintf("Diff mode: %s", m.diffMode.String())
+			if m.selectedF != "" {
+				m.loadingDiff = true
+				return m, m.loadDiffCmd(m.selectedF)
+			}
+			return m, nil
 		}
 
 		if m.focus == focusFiles {
@@ -271,11 +294,13 @@ func (m Model) updateDiffPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keys.Top):
 		m.diffCursor = 0
+		m.diffDirty = true
 		m.refreshDiffContent()
 		return m, nil
 
 	case key.Matches(msg, m.keys.Bottom):
 		m.diffCursor = len(m.diffRows) - 1
+		m.diffDirty = true
 		m.refreshDiffContent()
 		return m, nil
 
@@ -381,6 +406,7 @@ func (m *Model) saveCommentInput() {
 	m.commentInput = ""
 	m.commentEditAnchor = nil
 	m.statusMsg = fmt.Sprintf("Saved comment on %s:%d.", anchor.Path, anchor.Line)
+	m.diffDirty = true
 	m.refreshDiffContent()
 }
 
@@ -432,6 +458,7 @@ func (m *Model) deleteCommentAtCursor() {
 	}
 
 	m.statusMsg = fmt.Sprintf("Deleted comment on %s:%d.", anchor.Path, anchor.Line)
+	m.diffDirty = true
 	m.refreshDiffContent()
 }
 
@@ -462,6 +489,7 @@ func (m *Model) jumpToComment(direction int) {
 	}
 
 	m.diffCursor = next
+	m.diffDirty = true
 	m.refreshDiffContent()
 }
 
@@ -470,10 +498,10 @@ func (m Model) View() string {
 		return "Loading..."
 	}
 
-	help := "tab focus | j/k move | enter open diff | c/e/d comment | n/p comment nav | y export | r refresh | ? help | q quit"
+	help := "tab focus | j/k move | enter open diff | t mode | c/e/d comment | n/p comment nav | y export | r refresh | ? help | q quit"
 	if m.helpOpen {
 		help = strings.Join([]string{
-			"Global: q quit, tab switch focus, ? toggle help",
+			"Global: q quit, tab switch focus, t toggle diff mode, ? toggle help",
 			"Files pane: j/k move, enter open diff, r refresh",
 			"Diff pane: j/k move cursor, g/G top/bottom",
 			"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard",
@@ -498,14 +526,22 @@ func (m Model) View() string {
 	footerHeight := lineCount(footer)
 
 	leftW, rightW := paneWidths(m.width)
+	oldPaneW, newPaneW := splitRightPanes(rightW)
 	// lipgloss Height applies to content height; borders add 2 more rows.
 	paneContentHeight := max(1, m.height-footerHeight-2)
-	m.diffView.Width = max(1, rightW-4)
-	m.diffView.Height = max(1, paneContentHeight-4)
+	newOldWidth := max(1, oldPaneW-4)
+	newNewWidth := max(1, newPaneW-4)
+	if m.oldView.Width != newOldWidth || m.newView.Width != newNewWidth {
+		m.diffDirty = true
+	}
+	m.oldView.Width = newOldWidth
+	m.newView.Width = newNewWidth
+	m.oldView.Height = max(1, paneContentHeight-4)
+	m.newView.Height = max(1, paneContentHeight-4)
 	m.refreshDiffContent()
 
 	leftPane := m.renderFilesPane(leftW, paneContentHeight)
-	rightPane := m.renderDiffPane(rightW, paneContentHeight)
+	rightPane := m.renderDiffPanes(oldPaneW, newPaneW, paneContentHeight)
 	content := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
 
 	return lipgloss.JoinVertical(lipgloss.Left, content, footer)
@@ -513,7 +549,7 @@ func (m Model) View() string {
 
 func (m Model) renderFilesPane(width, height int) string {
 	border := lipgloss.NormalBorder()
-	borderColor := lipgloss.Color("241")
+	borderColor := lipgloss.Color("245")
 	if m.focus == focusFiles {
 		borderColor = lipgloss.Color("39")
 	}
@@ -543,7 +579,11 @@ func (m Model) renderFilesPane(width, height int) string {
 				prefix = "> "
 			}
 			line := fmt.Sprintf("%s[%s] %s", prefix, item.Status, item.Path)
-			bodyLines = append(bodyLines, lipgloss.NewStyle().Width(innerW).MaxWidth(innerW).Render(line))
+			lineStyle := lipgloss.NewStyle().Width(innerW).MaxWidth(innerW)
+			if i == m.selected {
+				lineStyle = lineStyle.Foreground(lipgloss.Color("39")).Bold(true)
+			}
+			bodyLines = append(bodyLines, lineStyle.Render(line))
 		}
 	}
 
@@ -555,9 +595,15 @@ func (m Model) renderFilesPane(width, height int) string {
 	return paneStyle.Render(strings.Join(bodyLines, "\n"))
 }
 
-func (m Model) renderDiffPane(width, height int) string {
+func (m Model) renderDiffPanes(oldWidth, newWidth, height int) string {
+	oldPane := m.renderDiffSidePane(oldWidth, height, "Old", m.oldView.View())
+	newPane := m.renderDiffSidePane(newWidth, height, "New", m.newView.View())
+	return lipgloss.JoinHorizontal(lipgloss.Top, oldPane, newPane)
+}
+
+func (m Model) renderDiffSidePane(width, height int, sideLabel, body string) string {
 	border := lipgloss.NormalBorder()
-	borderColor := lipgloss.Color("241")
+	borderColor := lipgloss.Color("245")
 	if m.focus == focusDiff {
 		borderColor = lipgloss.Color("39")
 	}
@@ -568,25 +614,29 @@ func (m Model) renderDiffPane(width, height int) string {
 		Border(border).
 		BorderForeground(borderColor)
 
-	title := "Diff"
+	title := sideLabel
 	if m.selectedF != "" {
-		title = "Diff: " + m.selectedF
+		title = sideLabel + ": " + m.selectedF
 	}
+	title += fmt.Sprintf(" [%s]", m.diffMode.String())
 	if m.loadingDiff {
 		title += " (loading...)"
 	}
 
 	innerW := max(1, width-4)
 	header := lipgloss.NewStyle().Bold(true).Width(innerW).MaxWidth(innerW).Render(title)
-	body := m.diffView.View()
 
 	return paneStyle.Render(header + "\n\n" + body)
 }
 
 func (m *Model) resizePanes() {
 	_, rightW := paneWidths(m.width)
-	m.diffView.Width = max(1, rightW-4)
-	m.diffView.Height = max(1, m.height-6)
+	oldPaneW, newPaneW := splitRightPanes(rightW)
+	m.oldView.Width = max(1, oldPaneW-4)
+	m.newView.Width = max(1, newPaneW-4)
+	m.oldView.Height = max(1, m.height-6)
+	m.newView.Height = max(1, m.height-6)
+	m.diffDirty = true
 }
 
 func (m Model) loadFilesCmd() tea.Cmd {
@@ -601,8 +651,9 @@ func (m Model) loadFilesCmd() tea.Cmd {
 func (m Model) loadDiffCmd(path string) tea.Cmd {
 	cwd := m.cwd
 	service := m.diffSvc
+	mode := m.diffMode
 	return func() tea.Msg {
-		d, err := service.AllChangesDiff(context.Background(), cwd, path)
+		d, err := service.Diff(context.Background(), cwd, path, mode)
 		if err != nil {
 			return diffLoadedMsg{path: path, err: err}
 		}
@@ -620,8 +671,10 @@ func (m Model) loadDiffCmd(path string) tea.Cmd {
 
 func (m Model) exportCommentsCmd() tea.Cmd {
 	snapshot := m.sortedComments()
+	mode := m.diffMode
 	return func() tea.Msg {
-		text := comments.ExportPlain(snapshot, "Review comments (all changes):")
+		title := fmt.Sprintf("Review comments (%s diff mode):", mode.String())
+		text := comments.ExportPlain(snapshot, title)
 		err := clipboard.CopyText(context.Background(), text)
 		return clipboardResultMsg{err: err}
 	}
@@ -639,7 +692,20 @@ func (m *Model) moveDiffCursor(delta int) {
 	if m.diffCursor >= len(m.diffRows) {
 		m.diffCursor = len(m.diffRows) - 1
 	}
+	m.diffDirty = true
 	m.refreshDiffContent()
+}
+
+func (m *Model) advanceDiffMode() {
+	switch m.diffMode {
+	case gitint.DiffModeAll:
+		m.diffMode = gitint.DiffModeUnstaged
+	case gitint.DiffModeUnstaged:
+		m.diffMode = gitint.DiffModeStaged
+	default:
+		m.diffMode = gitint.DiffModeAll
+	}
+	m.diffDirty = true
 }
 
 func (m *Model) refreshDiffContent() {
@@ -647,25 +713,46 @@ func (m *Model) refreshDiffContent() {
 		return
 	}
 	m.clampDiffCursor()
+	if !m.diffDirty && m.oldWidth == m.oldView.Width && m.newWidth == m.newView.Width {
+		m.ensureCursorVisible()
+		return
+	}
 
-	lines := diffview.RenderSideBySide(m.diffRows, m.diffView.Width, m.diffCursor, func(path string, line int, side diffview.Side) bool {
-		return m.hasComment(path, line, side)
-	})
-	m.diffView.SetContent(strings.Join(lines, "\n"))
+	oldLines, newLines := diffview.RenderSplit(
+		m.diffRows,
+		m.oldView.Width,
+		m.newView.Width,
+		m.diffCursor,
+		func(path string, line int, side diffview.Side) bool {
+			return m.hasComment(path, line, side)
+		},
+	)
+	m.oldView.SetContent(strings.Join(oldLines, "\n"))
+	m.newView.SetContent(strings.Join(newLines, "\n"))
+	m.oldWidth = m.oldView.Width
+	m.newWidth = m.newView.Width
+	m.diffDirty = false
 	m.ensureCursorVisible()
 }
 
 func (m *Model) ensureCursorVisible() {
-	if m.diffView.Height <= 0 {
+	visibleHeight := m.oldView.Height
+	if m.newView.Height < visibleHeight {
+		visibleHeight = m.newView.Height
+	}
+	if visibleHeight <= 0 {
 		return
 	}
-	if m.diffCursor < m.diffView.YOffset {
-		m.diffView.SetYOffset(m.diffCursor)
+	if m.diffCursor < m.oldView.YOffset {
+		m.oldView.SetYOffset(m.diffCursor)
+		m.newView.SetYOffset(m.diffCursor)
 		return
 	}
-	bottom := m.diffView.YOffset + m.diffView.Height - 1
+	bottom := m.oldView.YOffset + visibleHeight - 1
 	if m.diffCursor > bottom {
-		m.diffView.SetYOffset(m.diffCursor - m.diffView.Height + 1)
+		next := m.diffCursor - visibleHeight + 1
+		m.oldView.SetYOffset(next)
+		m.newView.SetYOffset(next)
 	}
 }
 

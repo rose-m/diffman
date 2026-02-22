@@ -13,6 +13,7 @@ type KeyMap struct {
 	Top         key.Binding
 	Bottom      key.Binding
 	Help        key.Binding
+	ToggleMode  key.Binding
 	Create      key.Binding
 	Edit        key.Binding
 	Delete      key.Binding
@@ -32,6 +33,7 @@ func defaultKeyMap() KeyMap {
 		Top:         key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "top")),
 		Bottom:      key.NewBinding(key.WithKeys("G"), key.WithHelp("G", "bottom")),
 		Help:        key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
+		ToggleMode:  key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "toggle diff mode")),
 		Create:      key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "new comment")),
 		Edit:        key.NewBinding(key.WithKeys("e"), key.WithHelp("e", "edit comment")),
 		Delete:      key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "delete comment")),

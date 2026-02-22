@@ -9,8 +9,29 @@ import (
 	"lediff/internal/util"
 )
 
+type DiffMode int
+
+const (
+	DiffModeAll DiffMode = iota
+	DiffModeUnstaged
+	DiffModeStaged
+)
+
+func (m DiffMode) String() string {
+	switch m {
+	case DiffModeAll:
+		return "all"
+	case DiffModeUnstaged:
+		return "unstaged"
+	case DiffModeStaged:
+		return "staged"
+	default:
+		return "unknown"
+	}
+}
+
 type DiffService interface {
-	AllChangesDiff(ctx context.Context, cwd, path string) (string, error)
+	Diff(ctx context.Context, cwd, path string, mode DiffMode) (string, error)
 }
 
 type diffService struct{}
@@ -19,13 +40,27 @@ func NewDiffService() DiffService {
 	return diffService{}
 }
 
-func (diffService) AllChangesDiff(ctx context.Context, cwd, path string) (string, error) {
-	out, err := util.Run(ctx, cwd, "git", "diff", "HEAD", "-U3", "--", path)
+func (diffService) Diff(ctx context.Context, cwd, path string, mode DiffMode) (string, error) {
+	args := []string{"diff", "-U3", "--", path}
+	switch mode {
+	case DiffModeAll:
+		args = []string{"diff", "HEAD", "-U3", "--", path}
+	case DiffModeStaged:
+		args = []string{"diff", "--cached", "-U3", "--", path}
+	case DiffModeUnstaged:
+		args = []string{"diff", "-U3", "--", path}
+	}
+
+	out, err := util.Run(ctx, cwd, "git", args...)
 	if err != nil {
 		return "", err
 	}
 	if strings.TrimSpace(out) != "" {
 		return out, nil
+	}
+
+	if mode == DiffModeStaged {
+		return "", nil
 	}
 
 	// Fallback for untracked paths; --no-index returns exit code 1 when diff exists.

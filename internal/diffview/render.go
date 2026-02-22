@@ -5,9 +5,18 @@ import (
 	"strings"
 )
 
-func RenderSideBySide(rows []DiffRow, width int, cursor int, hasComment func(path string, line int, side Side) bool) []string {
-	if width <= 0 {
-		return []string{""}
+func RenderSplit(
+	rows []DiffRow,
+	oldWidth int,
+	newWidth int,
+	cursor int,
+	hasComment func(path string, line int, side Side) bool,
+) ([]string, []string) {
+	if oldWidth <= 0 {
+		oldWidth = 1
+	}
+	if newWidth <= 0 {
+		newWidth = 1
 	}
 
 	maxOld := 0
@@ -23,62 +32,87 @@ func RenderSideBySide(rows []DiffRow, width int, cursor int, hasComment func(pat
 	oldNumW := maxInt(3, digits(maxOld))
 	newNumW := maxInt(3, digits(maxNew))
 
-	out := make([]string, 0, len(rows))
+	oldLines := make([]string, 0, len(rows))
+	newLines := make([]string, 0, len(rows))
 	for i, row := range rows {
-		cursorMark := " "
-		if i == cursor {
-			cursorMark = ">"
-		}
-
-		commentMark := " "
-		if hasRowComment(row, hasComment) {
-			commentMark = "*"
-		}
-
-		prefix := cursorMark + commentMark + " "
-		lineWidth := maxInt(1, width-len(prefix))
-		switch row.Kind {
-		case RowFileHeader, RowHunkHeader:
-			header := row.OldText
-			if header == "" {
-				header = row.NewText
-			}
-			out = append(out, prefix+padRight(truncateRunes(header, lineWidth), lineWidth))
-
-		default:
-			sep := " | "
-			bodyWidth := maxInt(1, lineWidth-len(sep))
-			leftW := bodyWidth / 2
-			rightW := bodyWidth - leftW
-			left := renderSideCell(row.OldLine, oldNumW, row.OldText, leftW)
-			right := renderSideCell(row.NewLine, newNumW, row.NewText, rightW)
-			out = append(out, prefix+left+sep+right)
-		}
+		oldLines = append(oldLines, renderRowForSide(row, SideOld, oldWidth, oldNumW, i == cursor, hasComment))
+		newLines = append(newLines, renderRowForSide(row, SideNew, newWidth, newNumW, i == cursor, hasComment))
 	}
-	return out
+	return oldLines, newLines
 }
 
-func renderSideCell(line *int, numW int, text string, width int) string {
-	if width <= 0 {
-		return ""
+func renderRowForSide(row DiffRow, side Side, width, numW int, isCursor bool, hasComment func(path string, line int, side Side) bool) string {
+	cursorMark := " "
+	if isCursor {
+		cursorMark = ">"
 	}
+
+	commentMark := " "
+	if hasCommentOnSide(row, side, hasComment) {
+		commentMark = "*"
+	}
+
+	prefix := cursorMark + commentMark + " "
+	lineWidth := maxInt(1, width-len(prefix))
+
+	switch row.Kind {
+	case RowFileHeader, RowHunkHeader:
+		header := row.OldText
+		if header == "" {
+			header = row.NewText
+		}
+		return prefix + padRight(truncateRunes(header, lineWidth), lineWidth)
+	}
+
+	lineNo, text, marker, ok := sideContent(row, side)
+	if !ok {
+		return prefix + strings.Repeat(" ", lineWidth)
+	}
+
 	num := ""
-	if line != nil {
-		num = fmt.Sprintf("%d", *line)
+	if lineNo != nil {
+		num = fmt.Sprintf("%d", *lineNo)
 	}
-	base := fmt.Sprintf("%*s %s", numW, num, text)
-	return padRight(truncateRunes(base, width), width)
+	base := fmt.Sprintf("%c %*s %s", marker, numW, num, text)
+	return prefix + padRight(truncateRunes(base, lineWidth), lineWidth)
 }
 
-func hasRowComment(row DiffRow, hasComment func(path string, line int, side Side) bool) bool {
+func sideContent(row DiffRow, side Side) (*int, string, rune, bool) {
+	switch side {
+	case SideOld:
+		if row.OldLine == nil {
+			return nil, "", ' ', false
+		}
+		marker := ' '
+		if row.Kind == RowDelete || row.Kind == RowChange {
+			marker = '-'
+		}
+		return row.OldLine, row.OldText, marker, true
+
+	case SideNew:
+		if row.NewLine == nil {
+			return nil, "", ' ', false
+		}
+		marker := ' '
+		if row.Kind == RowAdd || row.Kind == RowChange {
+			marker = '+'
+		}
+		return row.NewLine, row.NewText, marker, true
+	}
+
+	return nil, "", ' ', false
+}
+
+func hasCommentOnSide(row DiffRow, side Side, hasComment func(path string, line int, side Side) bool) bool {
 	if hasComment == nil {
 		return false
 	}
-	if row.OldLine != nil && hasComment(row.Path, *row.OldLine, SideOld) {
-		return true
+
+	if side == SideOld && row.OldLine != nil {
+		return hasComment(row.Path, *row.OldLine, SideOld)
 	}
-	if row.NewLine != nil && hasComment(row.Path, *row.NewLine, SideNew) {
-		return true
+	if side == SideNew && row.NewLine != nil {
+		return hasComment(row.Path, *row.NewLine, SideNew)
 	}
 	return false
 }
