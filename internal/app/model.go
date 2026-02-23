@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 
 	"lediff/internal/clipboard"
 	"lediff/internal/comments"
+	"lediff/internal/config"
 	"lediff/internal/diffview"
 	gitint "lediff/internal/git"
 )
@@ -27,6 +29,14 @@ const (
 	focusFiles focusPane = iota
 	focusDiff
 	focusComments
+)
+
+type diffPaneMode int
+
+const (
+	diffPaneModeSplit diffPaneMode = iota
+	diffPaneModeOldOnly
+	diffPaneModeNewOnly
 )
 
 const (
@@ -56,6 +66,11 @@ type commentStaleLoadedMsg struct {
 }
 
 type alertTickMsg struct{}
+
+type leaderCommandResultMsg struct {
+	key string
+	err error
+}
 
 type commentAnchor struct {
 	Path   string
@@ -103,6 +118,8 @@ type Model struct {
 
 	commentStore       comments.Store
 	comments           map[string]comments.Comment
+	leaderPending      bool
+	leaderCommands     map[string]string
 	commentInputActive bool
 	commentInputModel  textinput.Model
 	commentInputErr    string
@@ -137,6 +154,10 @@ func NewModel() (Model, error) {
 
 	store := comments.NewStore(gitDir)
 	loadedComments, loadErr := store.Load()
+	appConfig, configPath, configErr := config.Load()
+	if appConfig.LeaderCommands == nil {
+		appConfig.LeaderCommands = make(map[string]string)
+	}
 	commentMap := make(map[string]comments.Comment, len(loadedComments))
 	for _, c := range loadedComments {
 		commentMap[comments.AnchorKey(c.Path, c.Side, c.Line)] = c
@@ -162,6 +183,7 @@ func NewModel() (Model, error) {
 		commentStale:      make(map[string]bool),
 		commentStore:      store,
 		comments:          commentMap,
+		leaderCommands:    appConfig.LeaderCommands,
 		commentInputModel: commentInput,
 		diffDirty:         true,
 		oldWidth:          -1,
@@ -169,6 +191,9 @@ func NewModel() (Model, error) {
 	}
 	if loadErr != nil {
 		m.setAlert(fmt.Sprintf("failed to load comments: %v", loadErr))
+	}
+	if configErr != nil {
+		m.setAlert(fmt.Sprintf("failed to load config %s: %v", configPath, configErr))
 	}
 
 	m.oldView = viewport.New(1, 1)
@@ -287,12 +312,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, alertTickCmd()
 
+	case leaderCommandResultMsg:
+		if msg.err != nil {
+			m.setAlert(fmt.Sprintf("leader %s failed: %v", msg.key, msg.err))
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		if m.commentInputActive {
 			return m.handleCommentInput(msg)
 		}
 		if m.clearConfirmModal {
 			return m.handleClearConfirm(msg)
+		}
+		if m.leaderPending {
+			m.leaderPending = false
+			if msg.Type == tea.KeyEsc || isSpaceKey(msg) {
+				return m, nil
+			}
+			leaderKey, ok := leaderKeyFromMsg(msg)
+			if !ok {
+				return m, nil
+			}
+			command, found := m.leaderCommands[leaderKey]
+			if !found {
+				m.setAlert(fmt.Sprintf("No leader command for key %q.", leaderKey))
+				return m, nil
+			}
+			return m, m.execLeaderCommandCmd(leaderKey, command)
+		}
+		if isSpaceKey(msg) {
+			m.leaderPending = true
+			return m, nil
 		}
 		if m.focus == focusComments && isRuneKey(msg, "q") {
 			m.focus = m.commentsReturn
@@ -766,6 +817,24 @@ func parentDirPath(p string) string {
 
 func isRuneKey(msg tea.KeyMsg, key string) bool {
 	return msg.Type == tea.KeyRunes && msg.String() == key
+}
+
+func isSpaceKey(msg tea.KeyMsg) bool {
+	return msg.Type == tea.KeySpace || msg.String() == " "
+}
+
+func leaderKeyFromMsg(msg tea.KeyMsg) (string, bool) {
+	if msg.Type != tea.KeyRunes {
+		return "", false
+	}
+	key := msg.String()
+	if key == "" || key == " " {
+		return "", false
+	}
+	if len([]rune(key)) != 1 {
+		return "", false
+	}
+	return key, true
 }
 
 func indexOfFilePath(items []gitint.FileItem, path string) int {
@@ -1320,12 +1389,18 @@ func (m Model) View() string {
 		dockHeight = lipgloss.Height(dock)
 	}
 
-	leftW, rightW := paneWidths(m.width, m.filePaneW, m.fileHidden)
-	oldPaneW, newPaneW := splitRightPanes(rightW)
+	leftW, rightW := paneWidths(m.width, m.filePaneW, m.fileHidden, m.diffPaneMode() == diffPaneModeSplit)
+	oldPaneW, newPaneW := m.diffSidePaneWidths(rightW)
 	// lipgloss Height applies to content height; borders add 2 more rows.
 	paneContentHeight := max(1, m.height-footerHeight-dockHeight-2)
-	newOldWidth := max(1, oldPaneW)
-	newNewWidth := max(1, newPaneW)
+	newOldWidth := oldPaneW
+	if newOldWidth <= 0 {
+		newOldWidth = 1
+	}
+	newNewWidth := newPaneW
+	if newNewWidth <= 0 {
+		newNewWidth = 1
+	}
 	if m.oldView.Width != newOldWidth || m.newView.Width != newNewWidth {
 		m.diffDirty = true
 	}
@@ -1358,11 +1433,16 @@ func (m Model) View() string {
 }
 
 func (m Model) helpText() string {
+	leaderHint := ""
+	if m.leaderPending {
+		leaderHint = "leader pending | "
+	}
 	if !m.helpOpen {
-		return "tab focus | m comments view | j/k move | ctrl-f/b page | ctrl-e/y scroll | enter open diff | z zoom/hide files | t mode | c/e/d comment | n/p comment nav | y export | C clear all | r refresh | ? help | q quit"
+		return leaderHint + "tab focus | m comments view | j/k move | ctrl-f/b page | ctrl-e/y scroll | enter open diff | z zoom/hide files | <space> cmd | t mode | c/e/d comment | n/p comment nav | y export | C clear all | r refresh | ? help | q quit"
 	}
 	return strings.Join([]string{
 		"Global: q quit, tab switch focus, m comments view, t toggle diff mode, C clear all comments, ? toggle help",
+		"Leader: <space><key> runs configured command from ~/.config/lediff/config.json",
 		"Files pane: j/k move, ctrl-e/ctrl-y scroll, h/l tree nav, enter open diff, z toggle file pane width, r refresh",
 		"Diff pane: j/k move cursor, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, h focus files, z/l hide/show file list",
 		"Comments view: j/k move, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, e edit, d delete, enter jump to diff",
@@ -1801,9 +1881,51 @@ func collapseDirChain(start *fileTreeDir, collapsed map[string]bool) (*fileTreeD
 }
 
 func (m Model) renderDiffPanes(oldWidth, newWidth, height int) string {
-	oldPane := m.renderDiffSidePane(oldWidth, height, "Old", m.oldView.View(), false)
-	newPane := m.renderDiffSidePane(newWidth, height, "New", m.newView.View(), true)
-	return lipgloss.JoinHorizontal(lipgloss.Top, oldPane, newPane)
+	switch m.diffPaneMode() {
+	case diffPaneModeOldOnly:
+		return m.renderDiffSidePane(oldWidth, height, "Old", m.oldView.View(), true)
+	case diffPaneModeNewOnly:
+		return m.renderDiffSidePane(newWidth, height, "New", m.newView.View(), true)
+	default:
+		oldPane := m.renderDiffSidePane(oldWidth, height, "Old", m.oldView.View(), false)
+		newPane := m.renderDiffSidePane(newWidth, height, "New", m.newView.View(), true)
+		return lipgloss.JoinHorizontal(lipgloss.Top, oldPane, newPane)
+	}
+}
+
+func (m Model) diffPaneMode() diffPaneMode {
+	hasOld := false
+	hasNew := false
+	for _, row := range m.diffRows {
+		if row.OldLine != nil {
+			hasOld = true
+		}
+		if row.NewLine != nil {
+			hasNew = true
+		}
+		if hasOld && hasNew {
+			return diffPaneModeSplit
+		}
+	}
+	switch {
+	case hasOld && !hasNew:
+		return diffPaneModeOldOnly
+	case hasNew && !hasOld:
+		return diffPaneModeNewOnly
+	default:
+		return diffPaneModeSplit
+	}
+}
+
+func (m Model) diffSidePaneWidths(totalRight int) (int, int) {
+	switch m.diffPaneMode() {
+	case diffPaneModeOldOnly:
+		return totalRight, 0
+	case diffPaneModeNewOnly:
+		return 0, totalRight
+	default:
+		return splitRightPanes(totalRight)
+	}
 }
 
 func (m Model) renderDiffSidePane(width, height int, sideLabel, body string, withRightBorder bool) string {
@@ -1835,10 +1957,16 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string, wit
 }
 
 func (m *Model) resizePanes() {
-	_, rightW := paneWidths(m.width, m.filePaneW, m.fileHidden)
-	oldPaneW, newPaneW := splitRightPanes(rightW)
-	m.oldView.Width = max(1, oldPaneW)
-	m.newView.Width = max(1, newPaneW)
+	_, rightW := paneWidths(m.width, m.filePaneW, m.fileHidden, m.diffPaneMode() == diffPaneModeSplit)
+	oldPaneW, newPaneW := m.diffSidePaneWidths(rightW)
+	if oldPaneW <= 0 {
+		oldPaneW = 1
+	}
+	if newPaneW <= 0 {
+		newPaneW = 1
+	}
+	m.oldView.Width = oldPaneW
+	m.newView.Width = newPaneW
 	m.oldView.Height = max(1, m.height-6)
 	m.newView.Height = max(1, m.height-6)
 	m.diffDirty = true
@@ -1895,6 +2023,23 @@ func (m Model) exportCommentsCmd() tea.Cmd {
 		err := clipboard.CopyText(context.Background(), text)
 		return clipboardResultMsg{err: err}
 	}
+}
+
+func (m Model) execLeaderCommandCmd(key, command string) tea.Cmd {
+	sh := strings.TrimSpace(os.Getenv("SHELL"))
+	if sh == "" {
+		sh = "/bin/sh"
+	}
+
+	cmd := exec.Command(sh, "-lc", command)
+	cmd.Dir = m.cwd
+	cmd.Env = append(os.Environ(),
+		"ROOT="+m.cwd,
+		"FILE="+m.selectedF,
+	)
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		return leaderCommandResultMsg{key: key, err: err}
+	})
 }
 
 func (m *Model) moveDiffCursor(delta int) {
@@ -2062,15 +2207,27 @@ func (m *Model) refreshDiffContent() {
 		return
 	}
 	m.clampDiffCursor()
-	if !m.diffDirty && m.oldWidth == m.oldView.Width && m.newWidth == m.newView.Width {
+
+	renderOldW := m.oldView.Width
+	renderNewW := m.newView.Width
+	switch m.diffPaneMode() {
+	case diffPaneModeNewOnly:
+		renderOldW = max(1, m.newView.Width)
+		renderNewW = max(1, m.newView.Width)
+	case diffPaneModeOldOnly:
+		renderOldW = max(1, m.oldView.Width)
+		renderNewW = max(1, m.oldView.Width)
+	}
+
+	if !m.diffDirty && m.oldWidth == renderOldW && m.newWidth == renderNewW {
 		m.ensureCursorVisible()
 		return
 	}
 
 	rendered := diffview.RenderSplitWithLayoutComments(
 		m.diffRows,
-		m.oldView.Width,
-		m.newView.Width,
+		renderOldW,
+		renderNewW,
 		m.diffCursor,
 		func(path string, line int, side diffview.Side) bool {
 			return m.hasComment(path, line, side)
@@ -2083,8 +2240,8 @@ func (m *Model) refreshDiffContent() {
 	m.newView.SetContent(strings.Join(rendered.NewLines, "\n"))
 	m.rowStarts = rendered.RowStarts
 	m.rowHeights = rendered.RowHeights
-	m.oldWidth = m.oldView.Width
-	m.newWidth = m.newView.Width
+	m.oldWidth = renderOldW
+	m.newWidth = renderNewW
 	m.diffDirty = false
 	m.ensureCursorVisible()
 }

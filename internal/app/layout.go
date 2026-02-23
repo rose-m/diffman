@@ -1,10 +1,16 @@
 package app
 
-func paneWidths(totalWidth int, desiredLeft int, hideLeft bool) (int, int) {
+func paneWidths(totalWidth int, desiredLeft int, hideLeft bool, splitRight bool) (int, int) {
 	if hideLeft {
-		// Hidden file list: only split diff panes are visible.
-		// Border overhead for split diff panes is 3 (left + divider + right).
-		available := totalWidth - 3
+		// Hidden file list: only diff pane(s) are visible.
+		// Border overhead is:
+		//   split right panes => 3 (left + divider + right)
+		//   single right pane => 2 (left + right)
+		overhead := 2
+		if splitRight {
+			overhead = 3
+		}
+		available := totalWidth - overhead
 		if available < 1 {
 			return 0, 1
 		}
@@ -14,9 +20,14 @@ func paneWidths(totalWidth int, desiredLeft int, hideLeft bool) (int, int) {
 	// Widths returned here are content widths, not outer widths.
 	// Border overhead:
 	//   files pane => 2 (left+right)
-	//   split diff panes => 3 (outer left + shared divider + outer right)
-	//   total border overhead = 5
-	available := totalWidth - 5
+	//   right pane area =>
+	//      split diff panes => 3 (outer left + shared divider + outer right)
+	//      single diff pane => 2 (outer left + outer right)
+	overhead := 4
+	if splitRight {
+		overhead = 5
+	}
+	available := totalWidth - overhead
 	if available < 2 {
 		return 1, 1
 	}
