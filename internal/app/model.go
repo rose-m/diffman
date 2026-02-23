@@ -125,7 +125,12 @@ func NewModel() (Model, error) {
 		return Model{}, err
 	}
 
-	gitDir, err := gitint.DiscoverGitDir(context.Background(), cwd)
+	repoRoot, err := gitint.DiscoverRepoRoot(context.Background(), cwd)
+	if err != nil {
+		return Model{}, err
+	}
+
+	gitDir, err := gitint.DiscoverGitDir(context.Background(), repoRoot)
 	if err != nil {
 		return Model{}, err
 	}
@@ -146,7 +151,7 @@ func NewModel() (Model, error) {
 	m := Model{
 		keys:              defaultKeyMap(),
 		focus:             focusFiles,
-		cwd:               cwd,
+		cwd:               repoRoot,
 		diffMode:          gitint.DiffModeAll,
 		statusSvc:         gitint.NewStatusService(),
 		diffSvc:           gitint.NewDiffService(),
@@ -523,7 +528,10 @@ func (m *Model) handleFilesLeft(entries []fileTreeEntry) (tea.Model, tea.Cmd) {
 	m.clampFileCursor(entries)
 	entry := entries[m.fileCursor]
 	if !entry.IsDir {
-		parent := parentDirPath(entry.Path)
+		parent := entry.ParentPath
+		if parent == "" {
+			parent = parentDirPath(entry.Path)
+		}
 		if parent != "" && m.setFileCursorByDir(entries, parent) {
 			m.ensureFileCursorVisible(entries)
 			return *m, nil
@@ -537,7 +545,10 @@ func (m *Model) handleFilesLeft(entries []fileTreeEntry) (tea.Model, tea.Cmd) {
 		return *m, nil
 	}
 
-	parent := parentDirPath(entry.Path)
+	parent := entry.ParentPath
+	if parent == "" {
+		parent = parentDirPath(entry.Path)
+	}
 	if parent != "" {
 		m.setFileCursorByDir(entries, parent)
 	}
@@ -1550,6 +1561,7 @@ func (m Model) renderFilesPane(width, height int) string {
 				}
 				line = fmt.Sprintf("%s%s%s [%s] %s", prefix, indent, commentMark, entry.Status, entry.Name)
 			}
+			line = ansi.Truncate(line, innerW, "")
 			lineStyle := lipgloss.NewStyle().Width(innerW).MaxWidth(innerW)
 			if entry.IsDir {
 				lineStyle = lineStyle.Foreground(lipgloss.Color("244"))
@@ -1647,6 +1659,7 @@ func (m Model) renderCommentsPane(width, height int) string {
 
 type fileTreeEntry struct {
 	Path       string
+	ParentPath string
 	Name       string
 	Depth      int
 	IsDir      bool
@@ -1719,11 +1732,11 @@ func (m Model) fileTreeEntries() []fileTreeEntry {
 	}
 
 	out := make([]fileTreeEntry, 0, len(m.fileItems)*2)
-	flattenTreeEntries(root, 0, m.treeCollapsed, &out)
+	flattenTreeEntries(root, 0, m.treeCollapsed, &out, "")
 	return out
 }
 
-func flattenTreeEntries(node *fileTreeDir, depth int, collapsed map[string]bool, out *[]fileTreeEntry) {
+func flattenTreeEntries(node *fileTreeDir, depth int, collapsed map[string]bool, out *[]fileTreeEntry, parentVisiblePath string) {
 	dirNames := make([]string, 0, len(node.Dirs))
 	for name := range node.Dirs {
 		dirNames = append(dirNames, name)
@@ -1731,17 +1744,19 @@ func flattenTreeEntries(node *fileTreeDir, depth int, collapsed map[string]bool,
 	sort.Strings(dirNames)
 	for _, name := range dirNames {
 		child := node.Dirs[name]
+		leaf, displayName := collapseDirChain(child, collapsed)
 		*out = append(*out, fileTreeEntry{
-			Path:      child.Path,
-			Name:      child.Name,
-			Depth:     depth,
-			IsDir:     true,
-			FileIndex: -1,
+			Path:       leaf.Path,
+			ParentPath: parentVisiblePath,
+			Name:       displayName,
+			Depth:      depth,
+			IsDir:      true,
+			FileIndex:  -1,
 		})
-		if collapsed != nil && collapsed[child.Path] {
+		if collapsed != nil && collapsed[leaf.Path] {
 			continue
 		}
-		flattenTreeEntries(child, depth+1, collapsed, out)
+		flattenTreeEntries(leaf, depth+1, collapsed, out, leaf.Path)
 	}
 
 	sort.Slice(node.Files, func(i, j int) bool {
@@ -1750,6 +1765,7 @@ func flattenTreeEntries(node *fileTreeDir, depth int, collapsed map[string]bool,
 	for _, f := range node.Files {
 		*out = append(*out, fileTreeEntry{
 			Path:       f.Path,
+			ParentPath: parentVisiblePath,
 			Name:       f.Name,
 			Depth:      depth,
 			IsDir:      false,
@@ -1758,6 +1774,30 @@ func flattenTreeEntries(node *fileTreeDir, depth int, collapsed map[string]bool,
 			HasComment: f.HasComment,
 		})
 	}
+}
+
+func collapseDirChain(start *fileTreeDir, collapsed map[string]bool) (*fileTreeDir, string) {
+	cur := start
+	parts := []string{start.Name}
+	for {
+		if collapsed != nil && collapsed[cur.Path] {
+			break
+		}
+		if len(cur.Files) > 0 || len(cur.Dirs) != 1 {
+			break
+		}
+		var next *fileTreeDir
+		for _, child := range cur.Dirs {
+			next = child
+			break
+		}
+		if next == nil {
+			break
+		}
+		parts = append(parts, next.Name)
+		cur = next
+	}
+	return cur, strings.Join(parts, "/")
 }
 
 func (m Model) renderDiffPanes(oldWidth, newWidth, height int) string {
