@@ -4,6 +4,8 @@
 
 It is built with Bubble Tea and designed for fast keyboard-driven review.
 
+https://github.com/user-attachments/assets/3cd5cae6-3137-4b85-bad8-30e8eddcc5bd
+
 ## Features
 
 - File tree for all changed files in the current repository.
