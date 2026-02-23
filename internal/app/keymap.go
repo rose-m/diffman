@@ -23,6 +23,7 @@ type KeyMap struct {
 	NextComment key.Binding
 	PrevComment key.Binding
 	Export      key.Binding
+	ClearAll    key.Binding
 }
 
 func defaultKeyMap() KeyMap {
@@ -46,5 +47,6 @@ func defaultKeyMap() KeyMap {
 		NextComment: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next comment")),
 		PrevComment: key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "prev comment")),
 		Export:      key.NewBinding(key.WithKeys("y"), key.WithHelp("y", "copy export")),
+		ClearAll:    key.NewBinding(key.WithKeys("C"), key.WithHelp("C", "clear all comments")),
 	}
 }

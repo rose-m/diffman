@@ -47,6 +47,8 @@ var (
 	cursorGutterStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("45")).Bold(true)
 	commentGutterStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("220")).Bold(true)
 	cursorCommentGutterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("201")).Bold(true)
+
+	commentInlineTextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 )
 
 func RenderSplit(
@@ -66,6 +68,17 @@ func RenderSplitWithLayout(
 	newWidth int,
 	cursor int,
 	hasComment func(path string, line int, side Side) bool,
+) SplitRender {
+	return RenderSplitWithLayoutComments(rows, oldWidth, newWidth, cursor, hasComment, nil)
+}
+
+func RenderSplitWithLayoutComments(
+	rows []DiffRow,
+	oldWidth int,
+	newWidth int,
+	cursor int,
+	hasComment func(path string, line int, side Side) bool,
+	commentText func(path string, line int, side Side) (string, bool),
 ) SplitRender {
 	if oldWidth <= 0 {
 		oldWidth = 1
@@ -95,8 +108,39 @@ func RenderSplitWithLayout(
 	}
 
 	for i, row := range rows {
-		oldSegs := renderRowSegments(row, SideOld, oldWidth, oldNumW, i == cursor, hasComment)
-		newSegs := renderRowSegments(row, SideNew, newWidth, newNumW, i == cursor, hasComment)
+		oldMain := renderRowSegments(row, SideOld, oldWidth, oldNumW, i == cursor, hasComment)
+		newMain := renderRowSegments(row, SideNew, newWidth, newNumW, i == cursor, hasComment)
+		mainHeight := maxInt(len(oldMain), len(newMain))
+		if mainHeight <= 0 {
+			mainHeight = 1
+		}
+		oldSegs := padSegments(oldMain, oldWidth, mainHeight)
+		newSegs := padSegments(newMain, newWidth, mainHeight)
+
+		if commentText != nil {
+			oldCommentBody, oldHasComment := commentTextForSide(row, SideOld, commentText)
+			newCommentBody, newHasComment := commentTextForSide(row, SideNew, commentText)
+			if oldHasComment || newHasComment {
+				oldIndent := commentTextIndent(row, SideOld, oldNumW)
+				newIndent := commentTextIndent(row, SideNew, newNumW)
+				oldCommentSegs := []string{}
+				if oldHasComment {
+					oldCommentSegs = renderInlineCommentSegments(oldCommentBody, oldWidth, oldIndent)
+				}
+				newCommentSegs := []string{}
+				if newHasComment {
+					newCommentSegs = renderInlineCommentSegments(newCommentBody, newWidth, newIndent)
+				}
+				commentHeight := maxInt(len(oldCommentSegs), len(newCommentSegs))
+				if commentHeight <= 0 {
+					commentHeight = 1
+				}
+				oldCommentSegs = padCommentSegments(oldCommentSegs, oldWidth, commentHeight)
+				newCommentSegs = padCommentSegments(newCommentSegs, newWidth, commentHeight)
+				oldSegs = append(oldSegs, oldCommentSegs...)
+				newSegs = append(newSegs, newCommentSegs...)
+			}
+		}
 
 		height := maxInt(len(oldSegs), len(newSegs))
 		if height <= 0 {
@@ -115,7 +159,13 @@ func RenderSplitWithLayout(
 	return out
 }
 
-func renderRowSegments(row DiffRow, side Side, width, numW int, isCursor bool, hasComment func(path string, line int, side Side) bool) []string {
+func renderRowSegments(
+	row DiffRow,
+	side Side,
+	width, numW int,
+	isCursor bool,
+	hasComment func(path string, line int, side Side) bool,
+) []string {
 	hasAnyComment := hasCommentOnAnySide(row, hasComment)
 	prefix := renderGutterPrefix(isCursor, hasAnyComment)
 	contPrefix := "   "
@@ -453,6 +503,85 @@ func hasCommentOnAnySide(row DiffRow, hasComment func(path string, line int, sid
 		return true
 	}
 	return false
+}
+
+func commentTextForSide(row DiffRow, side Side, commentText func(path string, line int, side Side) (string, bool)) (string, bool) {
+	if commentText == nil {
+		return "", false
+	}
+	switch side {
+	case SideOld:
+		if row.OldLine == nil {
+			return "", false
+		}
+		return commentText(row.Path, *row.OldLine, SideOld)
+	case SideNew:
+		if row.NewLine == nil {
+			return "", false
+		}
+		return commentText(row.Path, *row.NewLine, SideNew)
+	default:
+		return "", false
+	}
+}
+
+func commentTextIndent(row DiffRow, side Side, numW int) int {
+	lineNo, _, marker, ok := sideContent(row, side)
+	if !ok {
+		meta := fmt.Sprintf("%c %*s ", ' ', numW, "")
+		return 3 + len([]rune(meta))
+	}
+	num := ""
+	if lineNo != nil {
+		num = fmt.Sprintf("%d", *lineNo)
+	}
+	meta := fmt.Sprintf("%c %*s ", marker, numW, num)
+	return 3 + len([]rune(meta))
+}
+
+func renderInlineCommentSegments(commentBody string, width, indent int) []string {
+	if width <= 0 {
+		width = 1
+	}
+	if indent < 0 {
+		indent = 0
+	}
+	if indent >= width {
+		indent = width - 1
+	}
+	textWidth := maxInt(1, width-indent)
+	lines := strings.Split(commentBody, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		plain := normalizeDisplayText(line)
+		chunks := wrapRunesWithOffsets(plain, textWidth)
+		if len(chunks) == 0 {
+			chunks = []wrappedChunk{{text: "", start: 0}}
+		}
+		for _, chunk := range chunks {
+			raw := strings.Repeat(" ", indent) + chunk.text
+			pad := width - len([]rune(raw))
+			if pad < 0 {
+				pad = 0
+			}
+			out = append(out, commentInlineTextStyle.Render(raw+strings.Repeat(" ", pad)))
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, commentInlineTextStyle.Render(strings.Repeat(" ", width)))
+	}
+	return out
+}
+
+func padCommentSegments(segs []string, width, height int) []string {
+	if len(segs) >= height {
+		return segs
+	}
+	line := commentInlineTextStyle.Render(strings.Repeat(" ", maxInt(1, width)))
+	for len(segs) < height {
+		segs = append(segs, line)
+	}
+	return segs
 }
 
 func normalizeDisplayText(s string) string {

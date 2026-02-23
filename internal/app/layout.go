@@ -1,6 +1,16 @@
 package app
 
-func paneWidths(totalWidth int, desiredLeft int) (int, int) {
+func paneWidths(totalWidth int, desiredLeft int, hideLeft bool) (int, int) {
+	if hideLeft {
+		// Hidden file list: only split diff panes are visible.
+		// Border overhead for split diff panes is 3 (left + divider + right).
+		available := totalWidth - 3
+		if available < 1 {
+			return 0, 1
+		}
+		return 0, available
+	}
+
 	// Widths returned here are content widths, not outer widths.
 	// Border overhead:
 	//   files pane => 2 (left+right)

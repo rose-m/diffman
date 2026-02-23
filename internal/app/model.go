@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -68,10 +69,11 @@ type Model struct {
 	height int
 	ready  bool
 
-	fileItems []gitint.FileItem
-	selected  int
-	selectedF string
-	filePaneW int
+	fileItems  []gitint.FileItem
+	selected   int
+	selectedF  string
+	filePaneW  int
+	fileHidden bool
 
 	diffRows   []diffview.DiffRow
 	diffCursor int
@@ -87,11 +89,12 @@ type Model struct {
 	commentStore       comments.Store
 	comments           map[string]comments.Comment
 	commentInputActive bool
-	commentInput       string
+	commentInputModel  textinput.Model
 	commentInputErr    string
 	commentEditAnchor  *commentAnchor
 
-	alertMsg string
+	alertMsg          string
+	clearConfirmModal bool
 
 	loadingFiles bool
 	loadingDiff  bool
@@ -115,21 +118,28 @@ func NewModel() (Model, error) {
 	for _, c := range loadedComments {
 		commentMap[comments.AnchorKey(c.Path, c.Side, c.Line)] = c
 	}
+	commentInput := textinput.New()
+	commentInput.Prompt = ""
+	commentInput.Placeholder = "Type comment"
+	commentInput.CharLimit = 4096
+	commentInput.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
+	commentInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
 	m := Model{
-		keys:         defaultKeyMap(),
-		focus:        focusFiles,
-		cwd:          cwd,
-		diffMode:     gitint.DiffModeAll,
-		statusSvc:    gitint.NewStatusService(),
-		diffSvc:      gitint.NewDiffService(),
-		helpOpen:     false,
-		filePaneW:    filePaneWidthDefault,
-		commentStore: store,
-		comments:     commentMap,
-		diffDirty:    true,
-		oldWidth:     -1,
-		newWidth:     -1,
+		keys:              defaultKeyMap(),
+		focus:             focusFiles,
+		cwd:               cwd,
+		diffMode:          gitint.DiffModeAll,
+		statusSvc:         gitint.NewStatusService(),
+		diffSvc:           gitint.NewDiffService(),
+		helpOpen:          false,
+		filePaneW:         filePaneWidthDefault,
+		commentStore:      store,
+		comments:          commentMap,
+		commentInputModel: commentInput,
+		diffDirty:         true,
+		oldWidth:          -1,
+		newWidth:          -1,
 	}
 	if loadErr != nil {
 		m.alertMsg = fmt.Sprintf("failed to load comments: %v", loadErr)
@@ -225,6 +235,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.commentInputActive {
 			return m.handleCommentInput(msg)
 		}
+		if m.clearConfirmModal {
+			return m.handleClearConfirm(msg)
+		}
 		if m.alertMsg != "" {
 			m.alertMsg = ""
 			return m, nil
@@ -238,11 +251,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.focus = focusDiff
 			} else {
 				m.focus = focusFiles
+				m.ensureFilePaneVisible()
 			}
 			return m, nil
 		}
 		if key.Matches(msg, m.keys.FocusFiles) {
 			m.focus = focusFiles
+			m.ensureFilePaneVisible()
 			return m, nil
 		}
 		if key.Matches(msg, m.keys.FocusDiff) {
@@ -265,6 +280,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		if key.Matches(msg, m.keys.ClearAll) {
+			if len(m.comments) == 0 {
+				m.alertMsg = "No comments to clear."
+				return m, nil
+			}
+			m.clearConfirmModal = true
+			return m, nil
+		}
 
 		if m.focus == focusFiles {
 			return m.updateFilesPane(msg)
@@ -277,13 +300,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key.Matches(msg, m.keys.ToggleFiles) {
-		if m.filePaneW == filePaneWidthWide {
-			m.filePaneW = filePaneWidthDefault
-		} else {
-			m.filePaneW = filePaneWidthWide
-		}
-		m.diffDirty = true
-		m.resizePanes()
+		m.toggleFilePaneWidth()
 		return m, nil
 	}
 
@@ -328,6 +345,11 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) updateDiffPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, m.keys.ToggleFiles) {
+		m.toggleFilePaneHidden()
+		return m, nil
+	}
+
 	if len(m.diffRows) == 0 {
 		return m, nil
 	}
@@ -354,12 +376,10 @@ func (m Model) updateDiffPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Create):
-		m.startCommentEdit(false)
-		return m, nil
+		return m, m.startCommentEdit(false)
 
 	case key.Matches(msg, m.keys.Edit):
-		m.startCommentEdit(true)
-		return m, nil
+		return m, m.startCommentEdit(true)
 
 	case key.Matches(msg, m.keys.Delete):
 		m.deleteCommentAtCursor()
@@ -387,46 +407,58 @@ func (m Model) handleCommentInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.commentInputActive = false
-		m.commentInput = ""
+		m.commentInputModel.SetValue("")
+		m.commentInputModel.Blur()
 		m.commentInputErr = ""
 		m.commentEditAnchor = nil
 		return m, nil
 
 	case tea.KeyEnter:
-		m.saveCommentInput()
-		return m, nil
-
-	case tea.KeyBackspace, tea.KeyCtrlH:
-		m.commentInput = removeLastRune(m.commentInput)
-		m.commentInputErr = ""
-		return m, nil
-
-	case tea.KeySpace:
-		m.commentInput += " "
-		m.commentInputErr = ""
-		return m, nil
-
-	case tea.KeyRunes:
-		m.commentInput += msg.String()
-		m.commentInputErr = ""
-		return m, nil
+		return m, m.saveCommentInput()
 	}
 
+	var cmd tea.Cmd
+	m.commentInputModel, cmd = m.commentInputModel.Update(msg)
+	m.commentInputErr = ""
+	return m, cmd
+}
+
+func (m Model) handleClearConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.clearConfirmModal = false
+		return m, nil
+	case tea.KeyEnter:
+		m.clearConfirmModal = false
+		m.clearAllComments()
+		return m, nil
+	case tea.KeyRunes:
+		switch msg.String() {
+		case "y", "Y":
+			m.clearConfirmModal = false
+			m.clearAllComments()
+			return m, nil
+		case "n", "N":
+			m.clearConfirmModal = false
+			return m, nil
+		}
+	}
 	return m, nil
 }
 
-func (m *Model) saveCommentInput() {
+func (m *Model) saveCommentInput() tea.Cmd {
 	if m.commentEditAnchor == nil {
 		m.commentInputActive = false
-		m.commentInput = ""
+		m.commentInputModel.SetValue("")
+		m.commentInputModel.Blur()
 		m.commentInputErr = ""
-		return
+		return nil
 	}
 
-	body := strings.TrimSpace(m.commentInput)
+	body := strings.TrimSpace(m.commentInputModel.Value())
 	if body == "" {
 		m.commentInputErr = "Comment text is empty."
-		return
+		return nil
 	}
 
 	anchor := *m.commentEditAnchor
@@ -450,40 +482,45 @@ func (m *Model) saveCommentInput() {
 	}
 
 	if err := m.persistComments(); err != nil {
-		m.alertMsg = fmt.Sprintf("failed to save comments: %v", err)
-		return
+		m.commentInputErr = fmt.Sprintf("failed to save comment: %v", err)
+		return nil
 	}
 
 	m.commentInputActive = false
-	m.commentInput = ""
+	m.commentInputModel.SetValue("")
+	m.commentInputModel.Blur()
 	m.commentInputErr = ""
 	m.commentEditAnchor = nil
 	m.diffDirty = true
 	m.refreshDiffContent()
+	return nil
 }
 
-func (m *Model) startCommentEdit(requireExisting bool) {
+func (m *Model) startCommentEdit(requireExisting bool) tea.Cmd {
 	anchor, ok := m.currentAnchor()
 	if !ok {
 		m.alertMsg = "No commentable line selected."
-		return
+		return nil
 	}
 
 	key := comments.AnchorKey(anchor.Path, anchor.Side, anchor.Line)
 	existing, exists := m.comments[key]
 	if requireExisting && !exists {
 		m.alertMsg = "No comment exists on selected line."
-		return
+		return nil
 	}
 
 	m.commentInputActive = true
-	m.commentInput = ""
+	m.commentInputModel.SetValue("")
 	m.commentInputErr = ""
 	if exists {
-		m.commentInput = existing.Body
+		m.commentInputModel.SetValue(existing.Body)
 	}
+	cmd := m.commentInputModel.Focus()
+	m.commentInputModel.CursorEnd()
 	a := anchor
 	m.commentEditAnchor = &a
+	return cmd
 }
 
 func (m *Model) deleteCommentAtCursor() {
@@ -505,6 +542,21 @@ func (m *Model) deleteCommentAtCursor() {
 		return
 	}
 
+	m.diffDirty = true
+	m.refreshDiffContent()
+}
+
+func (m *Model) clearAllComments() {
+	if len(m.comments) == 0 {
+		return
+	}
+	prev := m.comments
+	m.comments = make(map[string]comments.Comment)
+	if err := m.persistComments(); err != nil {
+		m.comments = prev
+		m.alertMsg = fmt.Sprintf("failed to clear comments: %v", err)
+		return
+	}
 	m.diffDirty = true
 	m.refreshDiffContent()
 }
@@ -538,6 +590,7 @@ func (m *Model) jumpToComment(direction int) {
 	m.diffCursor = next
 	m.diffDirty = true
 	m.refreshDiffContent()
+	m.scrollCursorWithPadding(10)
 }
 
 func (m Model) View() string {
@@ -545,23 +598,34 @@ func (m Model) View() string {
 		return "Loading..."
 	}
 
-	help := "tab focus | h/l focus panes | j/k move | enter open diff | z file width | t mode | c/e/d comment | n/p comment nav | y export | r refresh | ? help | q quit"
+	help := "tab focus | h/l focus panes | j/k move | enter open diff | z zoom/hide files | t mode | c/e/d comment | n/p comment nav | y export | C clear all | r refresh | ? help | q quit"
 	if m.helpOpen {
 		help = strings.Join([]string{
-			"Global: q quit, tab switch focus, h files focus, l diff focus, t toggle diff mode, ? toggle help",
+			"Global: q quit, tab switch focus, h files focus, l diff focus, t toggle diff mode, C clear all comments, ? toggle help",
 			"Files pane: j/k move, enter open diff, z toggle file pane width, r refresh",
-			"Diff pane: j/k move cursor, g/G top/bottom",
+			"Diff pane: j/k move cursor, g/G top/bottom, z hide/show file list",
 			"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard",
 		}, "\n")
 	}
 
-	footer := truncateLinesToWidth(help, m.width)
-	footerHeight := lineCount(footer)
+	footerPlain := truncateLinesToWidth(help, m.width)
+	footerHeight := lineCount(footerPlain)
+	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(footerPlain)
 
-	leftW, rightW := paneWidths(m.width, m.filePaneW)
+	dock := ""
+	dockHeight := 0
+	if m.commentInputActive {
+		dock = m.renderCommentDock()
+		dockHeight = lipgloss.Height(dock)
+	} else if m.alertMsg != "" {
+		dock = m.renderAlertDock()
+		dockHeight = lipgloss.Height(dock)
+	}
+
+	leftW, rightW := paneWidths(m.width, m.filePaneW, m.fileHidden)
 	oldPaneW, newPaneW := splitRightPanes(rightW)
 	// lipgloss Height applies to content height; borders add 2 more rows.
-	paneContentHeight := max(1, m.height-footerHeight-2)
+	paneContentHeight := max(1, m.height-footerHeight-dockHeight-2)
 	newOldWidth := max(1, oldPaneW)
 	newNewWidth := max(1, newPaneW)
 	if m.oldView.Width != newOldWidth || m.newView.Width != newNewWidth {
@@ -573,20 +637,24 @@ func (m Model) View() string {
 	m.newView.Height = max(1, paneContentHeight-4)
 	m.refreshDiffContent()
 
-	leftPane := m.renderFilesPane(leftW, paneContentHeight)
 	rightPane := m.renderDiffPanes(oldPaneW, newPaneW, paneContentHeight)
-	content := lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
-	contentAreaHeight := paneContentHeight + 2
-	if m.commentInputActive {
-		content = overlayCentered(content, m.renderCommentModal(), m.width, contentAreaHeight)
-	} else if m.alertMsg != "" {
-		content = overlayCentered(content, m.renderAlertModal(), m.width, contentAreaHeight)
+	content := rightPane
+	if !m.fileHidden {
+		leftPane := m.renderFilesPane(leftW, paneContentHeight)
+		content = lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, content, footer)
+	body := content
+	if dock != "" {
+		body = lipgloss.JoinVertical(lipgloss.Left, body, dock)
+	}
+	if m.clearConfirmModal {
+		body = overlayCentered(body, m.renderClearAllConfirmModal(), m.width, lipgloss.Height(body))
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, body, footer)
 }
 
-func (m Model) renderCommentModal() string {
+func (m Model) renderCommentDock() string {
 	title := "Add Comment"
 	if m.commentEditAnchor != nil {
 		key := comments.AnchorKey(m.commentEditAnchor.Path, m.commentEditAnchor.Side, m.commentEditAnchor.Line)
@@ -595,13 +663,15 @@ func (m Model) renderCommentModal() string {
 		}
 	}
 
-	innerW := max(10, m.modalWidth()-8)
+	contentW := max(10, m.width-2)
+	inputWidth := max(1, contentW-9)
+	input := m.commentInputModel
+	input.Width = inputWidth
 	inputBox := lipgloss.NewStyle().
-		Width(innerW).
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("63")).
 		Padding(0, 1).
-		Render(m.renderCommentInputLine(innerW))
+		Render(input.View())
 	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Enter save | Esc cancel | Backspace delete")
 
 	bodyLines := []string{inputBox, "", hint}
@@ -611,50 +681,53 @@ func (m Model) renderCommentModal() string {
 	}
 
 	body := strings.Join(bodyLines, "\n")
-	return m.renderModalCard(title, lipgloss.Color("39"), lipgloss.Color("39"), body)
+	return m.renderDockPanel(title, lipgloss.Color("39"), lipgloss.Color("39"), body)
 }
 
-func (m Model) renderAlertModal() string {
+func (m Model) renderAlertDock() string {
 	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Press any key to dismiss")
 	body := strings.Join([]string{
 		m.alertMsg,
 		"",
 		hint,
 	}, "\n")
-	return m.renderModalCard("Notice", lipgloss.Color("220"), lipgloss.Color("220"), body)
+	return m.renderDockPanel("Notice", lipgloss.Color("220"), lipgloss.Color("220"), body)
 }
 
-func (m Model) renderCommentInputLine(width int) string {
-	if width < 2 {
-		width = 2
+func (m Model) renderClearAllConfirmModal() string {
+	body := strings.Join([]string{
+		"Clear all comments across all files?",
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Y/Enter confirm | N/Esc cancel"),
+	}, "\n")
+
+	width := 54
+	if m.width > 0 && m.width-6 < width {
+		width = max(24, m.width-6)
 	}
-	cursor := lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("51")).Render(" ")
-	if m.commentInput == "" {
-		placeholderRaw := ansi.Truncate("(type comment)", width-1, "")
-		placeholder := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(placeholderRaw)
-		return placeholder + cursor
-	}
-	raw := ansi.Truncate(m.commentInput, width-1, "")
-	return raw + cursor
+
+	title := lipgloss.NewStyle().
+		Width(max(1, width-2)).
+		Padding(0, 1).
+		Bold(true).
+		Foreground(lipgloss.Color("230")).
+		Background(lipgloss.Color("196")).
+		Render("Clear All Comments")
+
+	bodyBlock := lipgloss.NewStyle().
+		Width(max(1, width-2)).
+		Padding(1, 2).
+		Render(body)
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("196")).
+		Render(title + "\n" + bodyBlock)
 }
 
-func (m Model) modalWidth() int {
-	w := m.width - 8
-	if w > 100 {
-		w = 100
-	}
-	if w < 30 {
-		w = m.width - 2
-	}
-	if w < 10 {
-		w = 10
-	}
-	return w
-}
-
-func (m Model) renderModalCard(title string, titleColor, borderColor lipgloss.Color, body string) string {
-	outerW := m.modalWidth()
-	contentW := max(10, outerW-2)
+func (m Model) renderDockPanel(title string, titleColor, borderColor lipgloss.Color, body string) string {
+	contentW := max(10, m.width-2)
 	titleText := ansi.Truncate(title, max(1, contentW-2), "")
 	titleBar := lipgloss.NewStyle().
 		Width(contentW).
@@ -673,88 +746,7 @@ func (m Model) renderModalCard(title string, titleColor, borderColor lipgloss.Co
 		Width(contentW).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
-		Background(lipgloss.Color("235")).
 		Render(titleBar + "\n" + bodyBlock)
-}
-
-func overlayCentered(base, overlay string, width, height int) string {
-	baseLines := normalizeCanvas(base, width, height)
-	overlayLines := strings.Split(overlay, "\n")
-	overlayW := lipgloss.Width(overlay)
-	overlayH := len(overlayLines)
-	if overlayW <= 0 || overlayH <= 0 {
-		return strings.Join(baseLines, "\n")
-	}
-
-	x := max(0, (width-overlayW)/2)
-	y := max(0, (height-overlayH)/2)
-	for i, ol := range overlayLines {
-		row := y + i
-		if row < 0 || row >= len(baseLines) {
-			continue
-		}
-		baseLines[row] = overlayLine(baseLines[row], ol, x, overlayW, width)
-	}
-	return strings.Join(baseLines, "\n")
-}
-
-func normalizeCanvas(s string, width, height int) []string {
-	if width < 1 {
-		width = 1
-	}
-	if height < 1 {
-		height = 1
-	}
-
-	raw := strings.Split(s, "\n")
-	lines := make([]string, 0, height)
-	for i := 0; i < height; i++ {
-		line := ""
-		if i < len(raw) {
-			line = raw[i]
-		}
-		w := lipgloss.Width(line)
-		switch {
-		case w > width:
-			lines = append(lines, ansi.Truncate(line, width, ""))
-		case w < width:
-			lines = append(lines, line+strings.Repeat(" ", width-w))
-		default:
-			lines = append(lines, line)
-		}
-	}
-	return lines
-}
-
-func overlayLine(baseLine, overlayLine string, x, overlayW, totalW int) string {
-	if overlayW <= 0 {
-		return baseLine
-	}
-	if x < 0 {
-		x = 0
-	}
-	if x >= totalW {
-		return baseLine
-	}
-	if x+overlayW > totalW {
-		overlayLine = ansi.Truncate(overlayLine, totalW-x, "")
-		overlayW = lipgloss.Width(overlayLine)
-		if overlayW <= 0 {
-			return baseLine
-		}
-	}
-
-	plain := []rune(ansi.Strip(baseLine))
-	if len(plain) < totalW {
-		plain = append(plain, []rune(strings.Repeat(" ", totalW-len(plain)))...)
-	}
-	left := string(plain[:x])
-	rightStart := x + overlayW
-	if rightStart > len(plain) {
-		rightStart = len(plain)
-	}
-	right := string(plain[rightStart:])
-	return left + overlayLine + right
 }
 
 func (m Model) renderFilesPane(width, height int) string {
@@ -840,7 +832,7 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string, wit
 }
 
 func (m *Model) resizePanes() {
-	_, rightW := paneWidths(m.width, m.filePaneW)
+	_, rightW := paneWidths(m.width, m.filePaneW, m.fileHidden)
 	oldPaneW, newPaneW := splitRightPanes(rightW)
 	m.oldView.Width = max(1, oldPaneW)
 	m.newView.Width = max(1, newPaneW)
@@ -906,6 +898,31 @@ func (m *Model) moveDiffCursor(delta int) {
 	m.refreshDiffContent()
 }
 
+func (m *Model) toggleFilePaneWidth() {
+	if m.filePaneW == filePaneWidthWide {
+		m.filePaneW = filePaneWidthDefault
+	} else {
+		m.filePaneW = filePaneWidthWide
+	}
+	m.diffDirty = true
+	m.resizePanes()
+}
+
+func (m *Model) toggleFilePaneHidden() {
+	m.fileHidden = !m.fileHidden
+	m.diffDirty = true
+	m.resizePanes()
+}
+
+func (m *Model) ensureFilePaneVisible() {
+	if !m.fileHidden {
+		return
+	}
+	m.fileHidden = false
+	m.diffDirty = true
+	m.resizePanes()
+}
+
 func (m *Model) advanceDiffMode() {
 	switch m.diffMode {
 	case gitint.DiffModeAll:
@@ -928,13 +945,16 @@ func (m *Model) refreshDiffContent() {
 		return
 	}
 
-	rendered := diffview.RenderSplitWithLayout(
+	rendered := diffview.RenderSplitWithLayoutComments(
 		m.diffRows,
 		m.oldView.Width,
 		m.newView.Width,
 		m.diffCursor,
 		func(path string, line int, side diffview.Side) bool {
 			return m.hasComment(path, line, side)
+		},
+		func(path string, line int, side diffview.Side) (string, bool) {
+			return m.commentText(path, line, side)
 		},
 	)
 	m.oldView.SetContent(strings.Join(rendered.OldLines, "\n"))
@@ -967,6 +987,55 @@ func (m *Model) ensureCursorVisible() {
 		m.oldView.SetYOffset(next)
 		m.newView.SetYOffset(next)
 	}
+}
+
+func (m *Model) scrollCursorWithPadding(padding int) {
+	if padding < 0 {
+		padding = 0
+	}
+	visibleHeight := m.oldView.VisibleLineCount()
+	if nv := m.newView.VisibleLineCount(); nv < visibleHeight {
+		visibleHeight = nv
+	}
+	if visibleHeight <= 0 {
+		return
+	}
+
+	start, end := m.cursorVisualRange()
+	totalLines := m.oldView.TotalLineCount()
+	if n := m.newView.TotalLineCount(); n > totalLines {
+		totalLines = n
+	}
+	if totalLines <= 0 {
+		return
+	}
+	maxTop := totalLines - visibleHeight
+	if maxTop < 0 {
+		maxTop = 0
+	}
+
+	lowerBound := end + padding - visibleHeight + 1
+	upperBound := start - padding
+	newTop := m.oldView.YOffset
+	if lowerBound <= upperBound {
+		if newTop < lowerBound {
+			newTop = lowerBound
+		}
+		if newTop > upperBound {
+			newTop = upperBound
+		}
+	} else {
+		newTop = start - padding
+	}
+
+	if newTop < 0 {
+		newTop = 0
+	}
+	if newTop > maxTop {
+		newTop = maxTop
+	}
+	m.oldView.SetYOffset(newTop)
+	m.newView.SetYOffset(newTop)
 }
 
 func (m *Model) cursorVisualRange() (int, int) {
@@ -1004,6 +1073,18 @@ func (m *Model) hasComment(path string, line int, side diffview.Side) bool {
 	}
 	_, ok := m.comments[comments.AnchorKey(path, commentSide, line)]
 	return ok
+}
+
+func (m *Model) commentText(path string, line int, side diffview.Side) (string, bool) {
+	commentSide := comments.SideNew
+	if side == diffview.SideOld {
+		commentSide = comments.SideOld
+	}
+	c, ok := m.comments[comments.AnchorKey(path, commentSide, line)]
+	if !ok {
+		return "", false
+	}
+	return c.Body, true
 }
 
 func (m *Model) currentAnchor() (commentAnchor, bool) {
@@ -1166,15 +1247,84 @@ func firstRenderableRow(rows []diffview.DiffRow) int {
 	return 0
 }
 
-func removeLastRune(s string) string {
-	if s == "" {
-		return s
+func overlayCentered(base, overlay string, width, height int) string {
+	baseLines := normalizeCanvas(base, width, height)
+	overlayLines := strings.Split(overlay, "\n")
+	overlayW := lipgloss.Width(overlay)
+	overlayH := len(overlayLines)
+	if overlayW <= 0 || overlayH <= 0 {
+		return strings.Join(baseLines, "\n")
 	}
-	runes := []rune(s)
-	if len(runes) == 0 {
-		return ""
+
+	x := max(0, (width-overlayW)/2)
+	y := max(0, (height-overlayH)/2)
+	for i, ol := range overlayLines {
+		row := y + i
+		if row < 0 || row >= len(baseLines) {
+			continue
+		}
+		baseLines[row] = overlayLine(baseLines[row], ol, x, overlayW, width)
 	}
-	return string(runes[:len(runes)-1])
+	return strings.Join(baseLines, "\n")
+}
+
+func normalizeCanvas(s string, width, height int) []string {
+	if width < 1 {
+		width = 1
+	}
+	if height < 1 {
+		height = 1
+	}
+
+	raw := strings.Split(s, "\n")
+	lines := make([]string, 0, height)
+	for i := 0; i < height; i++ {
+		line := ""
+		if i < len(raw) {
+			line = raw[i]
+		}
+		w := lipgloss.Width(line)
+		switch {
+		case w > width:
+			lines = append(lines, ansi.Truncate(line, width, ""))
+		case w < width:
+			lines = append(lines, line+strings.Repeat(" ", width-w))
+		default:
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func overlayLine(baseLine, overlayLine string, x, overlayW, totalW int) string {
+	if overlayW <= 0 {
+		return baseLine
+	}
+	if x < 0 {
+		x = 0
+	}
+	if x >= totalW {
+		return baseLine
+	}
+	if x+overlayW > totalW {
+		overlayLine = ansi.Truncate(overlayLine, totalW-x, "")
+		overlayW = lipgloss.Width(overlayLine)
+		if overlayW <= 0 {
+			return baseLine
+		}
+	}
+
+	plain := []rune(ansi.Strip(baseLine))
+	if len(plain) < totalW {
+		plain = append(plain, []rune(strings.Repeat(" ", totalW-len(plain)))...)
+	}
+	left := string(plain[:x])
+	rightStart := x + overlayW
+	if rightStart > len(plain) {
+		rightStart = len(plain)
+	}
+	right := string(plain[rightStart:])
+	return left + overlayLine + right
 }
 
 func truncateLinesToWidth(text string, width int) string {

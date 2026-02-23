@@ -222,8 +222,116 @@ func TestRenderSplitWithLayoutCursorStylingDoesNotChangeWrapWidth(t *testing.T) 
 	}
 }
 
+func TestRenderSplitWithLayoutCommentsShowsInlineCommentBelowAnchoredSide(t *testing.T) {
+	rows := []DiffRow{
+		{
+			Kind:    RowChange,
+			Path:    "a.txt",
+			OldLine: intPtr(12),
+			NewLine: intPtr(12),
+			OldText: "old",
+			NewText: "new",
+		},
+	}
+
+	out := RenderSplitWithLayoutComments(
+		rows,
+		34,
+		34,
+		0,
+		func(path string, line int, side Side) bool {
+			return path == "a.txt" && line == 12 && side == SideNew
+		},
+		func(path string, line int, side Side) (string, bool) {
+			if path == "a.txt" && line == 12 && side == SideNew {
+				return "new-side note", true
+			}
+			return "", false
+		},
+	)
+
+	if out.RowHeights[0] < 2 {
+		t.Fatalf("expected inline comment to add visual height, got %d", out.RowHeights[0])
+	}
+	newCommentLine := stripANSI(out.NewLines[1])
+	if !strings.HasPrefix(newCommentLine, strings.Repeat(" ", 9)+"new-side note") {
+		t.Fatalf("expected inline comment text on new side, got %q", stripANSI(out.NewLines[1]))
+	}
+	if strings.Contains(newCommentLine, "comment:") {
+		t.Fatalf("unexpected comment prefix in rendered line: %q", newCommentLine)
+	}
+	if strings.TrimSpace(stripANSI(out.OldLines[1])) != "" {
+		t.Fatalf("expected old side padded blank line for new-side comment, got %q", stripANSI(out.OldLines[1]))
+	}
+	if lipgloss.Width(out.NewLines[1]) != 34 {
+		t.Fatalf("expected full-width new-side comment row, got width=%d", lipgloss.Width(out.NewLines[1]))
+	}
+	if lipgloss.Width(out.OldLines[1]) != 34 {
+		t.Fatalf("expected full-width old-side mirrored row, got width=%d", lipgloss.Width(out.OldLines[1]))
+	}
+}
+
+func TestRenderSplitWithLayoutCommentsWrapsLongCommentWithoutWidthOverflow(t *testing.T) {
+	rows := []DiffRow{
+		{
+			Kind:    RowAdd,
+			Path:    "a.txt",
+			NewLine: intPtr(7),
+			NewText: "x",
+		},
+	}
+
+	comment := "this comment is intentionally long so wrapping has to happen and tail words are still visible"
+	out := RenderSplitWithLayoutComments(
+		rows,
+		24,
+		24,
+		0,
+		func(path string, line int, side Side) bool {
+			return path == "a.txt" && line == 7 && side == SideNew
+		},
+		func(path string, line int, side Side) (string, bool) {
+			if path == "a.txt" && line == 7 && side == SideNew {
+				return comment, true
+			}
+			return "", false
+		},
+	)
+
+	if out.RowHeights[0] < 3 {
+		t.Fatalf("expected wrapped comment to span multiple lines, got %d", out.RowHeights[0])
+	}
+	if !strings.HasPrefix(stripANSI(out.NewLines[1]), strings.Repeat(" ", 9)+"this comment") {
+		t.Fatalf("expected comment text to follow code indent, got %q", stripANSI(out.NewLines[1]))
+	}
+	joined := strings.Join(stripANSILines(out.NewLines), " ")
+	compactJoined := strings.Join(strings.Fields(joined), "")
+	compactComment := strings.Join(strings.Fields(comment), "")
+	if !strings.Contains(compactJoined, compactComment) {
+		t.Fatalf("wrapped comment appears truncated: %q", joined)
+	}
+	for i, line := range out.NewLines {
+		if lipgloss.Width(line) > 24 {
+			t.Fatalf("new line %d exceeds width: %q", i, line)
+		}
+	}
+	for i, line := range out.OldLines {
+		if lipgloss.Width(line) > 24 {
+			t.Fatalf("old line %d exceeds width: %q", i, line)
+		}
+	}
+}
+
 func stripANSI(s string) string {
 	return ansiRE.ReplaceAllString(s, "")
+}
+
+func stripANSILines(lines []string) []string {
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = stripANSI(l)
+	}
+	return out
 }
 
 func intPtr(n int) *int {
