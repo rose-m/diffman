@@ -390,7 +390,6 @@ func (m Model) handleCommentInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.commentInput = ""
 		m.commentInputErr = ""
 		m.commentEditAnchor = nil
-		m.alertMsg = "Comment canceled."
 		return m, nil
 
 	case tea.KeyEnter:
@@ -459,7 +458,6 @@ func (m *Model) saveCommentInput() {
 	m.commentInput = ""
 	m.commentInputErr = ""
 	m.commentEditAnchor = nil
-	m.alertMsg = fmt.Sprintf("Saved comment on %s:%d.", anchor.Path, anchor.Line)
 	m.diffDirty = true
 	m.refreshDiffContent()
 }
@@ -507,7 +505,6 @@ func (m *Model) deleteCommentAtCursor() {
 		return
 	}
 
-	m.alertMsg = fmt.Sprintf("Deleted comment on %s:%d.", anchor.Path, anchor.Line)
 	m.diffDirty = true
 	m.refreshDiffContent()
 }
@@ -590,7 +587,7 @@ func (m Model) View() string {
 }
 
 func (m Model) renderCommentModal() string {
-	title := "New Comment"
+	title := "Add Comment"
 	if m.commentEditAnchor != nil {
 		key := comments.AnchorKey(m.commentEditAnchor.Path, m.commentEditAnchor.Side, m.commentEditAnchor.Line)
 		if _, exists := m.comments[key]; exists {
@@ -598,62 +595,47 @@ func (m Model) renderCommentModal() string {
 		}
 	}
 
-	anchor := "selected line"
-	if m.commentEditAnchor != nil {
-		anchor = fmt.Sprintf("%s %s:%d", m.commentEditAnchor.Path, m.commentEditAnchor.Side.String(), m.commentEditAnchor.Line)
-	}
+	innerW := max(10, m.modalWidth()-8)
+	inputBox := lipgloss.NewStyle().
+		Width(innerW).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("63")).
+		Padding(0, 1).
+		Render(m.renderCommentInputLine(innerW))
+	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Enter save | Esc cancel | Backspace delete")
 
-	bodyLines := []string{
-		title,
-		"",
-		"Target: " + anchor,
-		"",
-		"Comment:",
-		m.renderCommentInputLine(),
-		"",
-		"Enter save | Esc cancel | Backspace delete",
-	}
+	bodyLines := []string{inputBox, "", hint}
 	if m.commentInputErr != "" {
 		bodyLines = append(bodyLines, "")
-		bodyLines = append(bodyLines, "Error: "+m.commentInputErr)
+		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("Error: "+m.commentInputErr))
 	}
 
-	modalW := m.modalWidth()
 	body := strings.Join(bodyLines, "\n")
-	return lipgloss.NewStyle().
-		Width(modalW).
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("39")).
-		Background(lipgloss.Color("235")).
-		Padding(1, 2).
-		Render(body)
+	return m.renderModalCard(title, lipgloss.Color("39"), lipgloss.Color("39"), body)
 }
 
 func (m Model) renderAlertModal() string {
-	modalW := m.modalWidth()
+	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Press any key to dismiss")
 	body := strings.Join([]string{
-		"Notice",
-		"",
 		m.alertMsg,
 		"",
-		"Press any key to dismiss",
+		hint,
 	}, "\n")
-	return lipgloss.NewStyle().
-		Width(modalW).
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("220")).
-		Background(lipgloss.Color("235")).
-		Padding(1, 2).
-		Render(body)
+	return m.renderModalCard("Notice", lipgloss.Color("220"), lipgloss.Color("220"), body)
 }
 
-func (m Model) renderCommentInputLine() string {
+func (m Model) renderCommentInputLine(width int) string {
+	if width < 2 {
+		width = 2
+	}
 	cursor := lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("51")).Render(" ")
 	if m.commentInput == "" {
-		placeholder := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("(type comment)")
+		placeholderRaw := ansi.Truncate("(type comment)", width-1, "")
+		placeholder := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(placeholderRaw)
 		return placeholder + cursor
 	}
-	return m.commentInput + cursor
+	raw := ansi.Truncate(m.commentInput, width-1, "")
+	return raw + cursor
 }
 
 func (m Model) modalWidth() int {
@@ -668,6 +650,31 @@ func (m Model) modalWidth() int {
 		w = 10
 	}
 	return w
+}
+
+func (m Model) renderModalCard(title string, titleColor, borderColor lipgloss.Color, body string) string {
+	outerW := m.modalWidth()
+	contentW := max(10, outerW-2)
+	titleText := ansi.Truncate(title, max(1, contentW-2), "")
+	titleBar := lipgloss.NewStyle().
+		Width(contentW).
+		Padding(0, 1).
+		Bold(true).
+		Foreground(lipgloss.Color("230")).
+		Background(titleColor).
+		Render(titleText)
+
+	bodyBlock := lipgloss.NewStyle().
+		Width(contentW).
+		Padding(1, 2).
+		Render(body)
+
+	return lipgloss.NewStyle().
+		Width(contentW).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(borderColor).
+		Background(lipgloss.Color("235")).
+		Render(titleBar + "\n" + bodyBlock)
 }
 
 func overlayCentered(base, overlay string, width, height int) string {
