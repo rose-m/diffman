@@ -16,7 +16,7 @@ It is built with Bubble Tea and designed for fast keyboard-driven review.
 
 ## Requirements
 
-- Go `1.23+`
+- Go `1.26+`
 - `git`
 - A terminal with Unicode/color support
 
