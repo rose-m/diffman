@@ -26,6 +26,7 @@ type focusPane int
 const (
 	focusFiles focusPane = iota
 	focusDiff
+	focusComments
 )
 
 const (
@@ -49,6 +50,13 @@ type clipboardResultMsg struct {
 	err error
 }
 
+type commentStaleLoadedMsg struct {
+	stale map[string]bool
+	err   error
+}
+
+type alertTickMsg struct{}
+
 type commentAnchor struct {
 	Path   string
 	Side   comments.Side
@@ -69,11 +77,18 @@ type Model struct {
 	height int
 	ready  bool
 
-	fileItems  []gitint.FileItem
-	selected   int
-	selectedF  string
-	filePaneW  int
-	fileHidden bool
+	fileItems      []gitint.FileItem
+	selected       int
+	selectedF      string
+	filePaneW      int
+	fileHidden     bool
+	fileCursor     int
+	fileScroll     int
+	treeCollapsed  map[string]bool
+	commentsCursor int
+	commentsScroll int
+	commentsReturn focusPane
+	commentStale   map[string]bool
 
 	diffRows   []diffview.DiffRow
 	diffCursor int
@@ -92,9 +107,12 @@ type Model struct {
 	commentInputModel  textinput.Model
 	commentInputErr    string
 	commentEditAnchor  *commentAnchor
+	commentEditKey     string
 
-	alertMsg          string
-	clearConfirmModal bool
+	alertMsg           string
+	alertUntil         time.Time
+	clearConfirmModal  bool
+	pendingCommentJump *commentAnchor
 
 	loadingFiles bool
 	loadingDiff  bool
@@ -134,6 +152,9 @@ func NewModel() (Model, error) {
 		diffSvc:           gitint.NewDiffService(),
 		helpOpen:          false,
 		filePaneW:         filePaneWidthDefault,
+		treeCollapsed:     make(map[string]bool),
+		commentsReturn:    focusDiff,
+		commentStale:      make(map[string]bool),
 		commentStore:      store,
 		comments:          commentMap,
 		commentInputModel: commentInput,
@@ -142,7 +163,7 @@ func NewModel() (Model, error) {
 		newWidth:          -1,
 	}
 	if loadErr != nil {
-		m.alertMsg = fmt.Sprintf("failed to load comments: %v", loadErr)
+		m.setAlert(fmt.Sprintf("failed to load comments: %v", loadErr))
 	}
 
 	m.oldView = viewport.New(1, 1)
@@ -154,7 +175,7 @@ func NewModel() (Model, error) {
 
 func (m Model) Init() tea.Cmd {
 	m.loadingFiles = true
-	return m.loadFilesCmd()
+	return tea.Batch(m.loadFilesCmd(), alertTickCmd())
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -175,6 +196,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.fileItems) == 0 {
 			m.selected = 0
 			m.selectedF = ""
+			m.fileCursor = 0
+			m.fileScroll = 0
 			m.diffRows = nil
 			m.diffCursor = 0
 			m.rowStarts = nil
@@ -184,14 +207,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.newView.GotoTop()
 			m.oldView.SetContent("No changed files found in this repository.")
 			m.newView.SetContent("No changed files found in this repository.")
+			m.commentStale = m.staleAllComments()
 			return m, nil
 		}
 
+		if idx := indexOfFilePath(m.fileItems, m.selectedF); idx >= 0 {
+			m.selected = idx
+		}
 		if m.selected >= len(m.fileItems) {
 			m.selected = len(m.fileItems) - 1
 		}
 		m.selectedF = m.fileItems[m.selected].Path
-		return m, m.loadDiffCmd(m.selectedF)
+		m.syncFileCursorToSelectedPath()
+		m.ensureFileCursorVisible(m.fileTreeEntries())
+		return m, tea.Batch(
+			m.loadDiffCmd(m.selectedF),
+			m.loadCommentStaleCmd(m.fileItems, m.comments, m.diffMode),
+		)
 
 	case diffLoadedMsg:
 		m.loadingDiff = false
@@ -221,15 +253,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.diffCursor = firstRenderableRow(m.diffRows)
 		m.diffDirty = true
 		m.refreshDiffContent()
+		if m.pendingCommentJump != nil && m.pendingCommentJump.Path == msg.path {
+			m.jumpToCommentAnchor(*m.pendingCommentJump)
+			m.pendingCommentJump = nil
+		}
 		return m, nil
 
 	case clipboardResultMsg:
 		if msg.err != nil {
-			m.alertMsg = fmt.Sprintf("export failed: %v", msg.err)
+			m.setAlert(fmt.Sprintf("export failed: %v", msg.err))
 			return m, nil
 		}
-		m.alertMsg = "Copied comments export to clipboard."
+		m.setAlert("Copied comments export to clipboard.")
 		return m, nil
+
+	case commentStaleLoadedMsg:
+		if msg.stale == nil {
+			m.commentStale = make(map[string]bool)
+		} else {
+			m.commentStale = msg.stale
+		}
+		return m, nil
+
+	case alertTickMsg:
+		if m.alertMsg != "" && !m.alertUntil.IsZero() && time.Now().After(m.alertUntil) {
+			m.alertMsg = ""
+			m.alertUntil = time.Time{}
+		}
+		return m, alertTickCmd()
 
 	case tea.KeyMsg:
 		if m.commentInputActive {
@@ -238,8 +289,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.clearConfirmModal {
 			return m.handleClearConfirm(msg)
 		}
-		if m.alertMsg != "" {
-			m.alertMsg = ""
+		if m.focus == focusComments && isRuneKey(msg, "q") {
+			m.focus = m.commentsReturn
+			if m.focus == focusFiles {
+				m.ensureFilePaneVisible()
+			}
 			return m, nil
 		}
 
@@ -249,19 +303,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if key.Matches(msg, m.keys.ToggleFocus) {
 			if m.focus == focusFiles {
 				m.focus = focusDiff
+			} else if m.focus == focusDiff {
+				m.commentsReturn = focusDiff
+				m.focus = focusComments
 			} else {
 				m.focus = focusFiles
 				m.ensureFilePaneVisible()
 			}
 			return m, nil
 		}
-		if key.Matches(msg, m.keys.FocusFiles) {
-			m.focus = focusFiles
-			m.ensureFilePaneVisible()
-			return m, nil
-		}
-		if key.Matches(msg, m.keys.FocusDiff) {
-			m.focus = focusDiff
+		if key.Matches(msg, m.keys.CommentsView) {
+			if m.focus == focusComments {
+				m.focus = m.commentsReturn
+				if m.focus == focusFiles {
+					m.ensureFilePaneVisible()
+				}
+			} else {
+				m.commentsReturn = m.focus
+				m.focus = focusComments
+			}
 			return m, nil
 		}
 		if key.Matches(msg, m.keys.Help) {
@@ -276,13 +336,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.advanceDiffMode()
 			if m.selectedF != "" {
 				m.loadingDiff = true
-				return m, m.loadDiffCmd(m.selectedF)
+				return m, tea.Batch(
+					m.loadDiffCmd(m.selectedF),
+					m.loadCommentStaleCmd(m.fileItems, m.comments, m.diffMode),
+				)
 			}
-			return m, nil
+			return m, m.loadCommentStaleCmd(m.fileItems, m.comments, m.diffMode)
 		}
 		if key.Matches(msg, m.keys.ClearAll) {
 			if len(m.comments) == 0 {
-				m.alertMsg = "No comments to clear."
+				m.setAlert("No comments to clear.")
 				return m, nil
 			}
 			m.clearConfirmModal = true
@@ -291,6 +354,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.focus == focusFiles {
 			return m.updateFilesPane(msg)
+		}
+		if m.focus == focusComments {
+			return m.updateCommentsPane(msg)
 		}
 		return m.updateDiffPane(msg)
 	}
@@ -304,49 +370,597 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if len(m.fileItems) == 0 {
+	entries := m.fileTreeEntries()
+	if len(entries) == 0 {
 		return m, nil
 	}
+	m.clampFileCursor(entries)
 
 	switch {
 	case key.Matches(msg, m.keys.Up):
-		prev := m.selected
-		if m.selected > 0 {
-			m.selected--
+		if m.fileCursor > 0 {
+			m.fileCursor--
 		}
-		m.selectedF = m.fileItems[m.selected].Path
-		if m.selected != prev {
-			m.loadingDiff = true
-			return m, m.loadDiffCmd(m.selectedF)
-		}
-		return m, nil
+		m.ensureFileCursorVisible(entries)
+		return m.updateSelectedFileFromCursor(entries)
 
 	case key.Matches(msg, m.keys.Down):
-		prev := m.selected
-		if m.selected < len(m.fileItems)-1 {
-			m.selected++
+		if m.fileCursor < len(entries)-1 {
+			m.fileCursor++
 		}
-		m.selectedF = m.fileItems[m.selected].Path
-		if m.selected != prev {
+		m.ensureFileCursorVisible(entries)
+		return m.updateSelectedFileFromCursor(entries)
+
+	case key.Matches(msg, m.keys.ScrollDown):
+		return m.scrollFilesWindow(1, entries)
+
+	case key.Matches(msg, m.keys.ScrollUp):
+		return m.scrollFilesWindow(-1, entries)
+
+	case isRuneKey(msg, "h"):
+		return m.handleFilesLeft(entries)
+
+	case isRuneKey(msg, "l"):
+		return m.handleFilesRight(entries)
+
+	case key.Matches(msg, m.keys.Open):
+		entry := entries[m.fileCursor]
+		if entry.IsDir {
+			m.toggleDirCollapsed(entry.Path)
+			m.ensureFileCursorVisible(m.fileTreeEntries())
+			return m, nil
+		}
+		if entry.FileIndex >= 0 && entry.FileIndex < len(m.fileItems) {
+			m.selected = entry.FileIndex
+			m.selectedF = m.fileItems[m.selected].Path
 			m.loadingDiff = true
+			m.focus = focusDiff
 			return m, m.loadDiffCmd(m.selectedF)
 		}
 		return m, nil
-
-	case key.Matches(msg, m.keys.Open):
-		m.selectedF = m.fileItems[m.selected].Path
-		m.loadingDiff = true
-		m.focus = focusDiff
-		return m, m.loadDiffCmd(m.selectedF)
 
 	}
 
 	return m, nil
 }
 
+func (m *Model) updateSelectedFileFromCursor(entries []fileTreeEntry) (tea.Model, tea.Cmd) {
+	m.clampFileCursor(entries)
+	entry := entries[m.fileCursor]
+	if entry.IsDir || entry.FileIndex < 0 || entry.FileIndex >= len(m.fileItems) {
+		return *m, nil
+	}
+	if m.selected == entry.FileIndex && m.selectedF == entry.Path {
+		return *m, nil
+	}
+	m.selected = entry.FileIndex
+	m.selectedF = entry.Path
+	m.loadingDiff = true
+	return *m, m.loadDiffCmd(m.selectedF)
+}
+
+func (m Model) updateCommentsPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	items := m.sortedComments()
+	if len(items) == 0 {
+		switch {
+		case key.Matches(msg, m.keys.ScrollDown), key.Matches(msg, m.keys.ScrollUp):
+			return m, nil
+		case key.Matches(msg, m.keys.PageDown), key.Matches(msg, m.keys.PageUp):
+			return m, nil
+		case key.Matches(msg, m.keys.Top), key.Matches(msg, m.keys.Bottom):
+			return m, nil
+		case key.Matches(msg, m.keys.Edit), key.Matches(msg, m.keys.Delete), key.Matches(msg, m.keys.Open):
+			m.setAlert("No comments.")
+			return m, nil
+		}
+		return m, nil
+	}
+
+	m.clampCommentsCursor(items)
+	switch {
+	case key.Matches(msg, m.keys.Up):
+		if m.commentsCursor > 0 {
+			m.commentsCursor--
+		}
+		m.ensureCommentsCursorVisible(items)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Down):
+		if m.commentsCursor < len(items)-1 {
+			m.commentsCursor++
+		}
+		m.ensureCommentsCursorVisible(items)
+		return m, nil
+
+	case key.Matches(msg, m.keys.ScrollDown):
+		m.scrollCommentsWindow(1, items)
+		return m, nil
+
+	case key.Matches(msg, m.keys.ScrollUp):
+		m.scrollCommentsWindow(-1, items)
+		return m, nil
+
+	case key.Matches(msg, m.keys.PageDown):
+		m.pageComments(1, items)
+		return m, nil
+
+	case key.Matches(msg, m.keys.PageUp):
+		m.pageComments(-1, items)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Top):
+		m.commentsCursor = 0
+		m.ensureCommentsCursorVisible(items)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Bottom):
+		m.commentsCursor = len(items) - 1
+		m.ensureCommentsCursorVisible(items)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Edit):
+		return m, m.startCommentEditByComment(items[m.commentsCursor])
+
+	case key.Matches(msg, m.keys.Delete):
+		m.deleteCommentByKey(commentKey(items[m.commentsCursor]))
+		next := m.sortedComments()
+		m.clampCommentsCursor(next)
+		m.ensureCommentsCursorVisible(next)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Open):
+		if m.isCommentStale(items[m.commentsCursor]) {
+			m.setAlert("Selected comment is stale and cannot be jumped to.")
+			return m, nil
+		}
+		return m, m.jumpToCommentInDiff(items[m.commentsCursor])
+	}
+
+	return m, nil
+}
+
+func (m *Model) handleFilesLeft(entries []fileTreeEntry) (tea.Model, tea.Cmd) {
+	m.clampFileCursor(entries)
+	entry := entries[m.fileCursor]
+	if !entry.IsDir {
+		parent := parentDirPath(entry.Path)
+		if parent != "" && m.setFileCursorByDir(entries, parent) {
+			m.ensureFileCursorVisible(entries)
+			return *m, nil
+		}
+		return *m, nil
+	}
+
+	if !m.isDirCollapsed(entry.Path) {
+		m.toggleDirCollapsed(entry.Path)
+		m.ensureFileCursorVisible(m.fileTreeEntries())
+		return *m, nil
+	}
+
+	parent := parentDirPath(entry.Path)
+	if parent != "" {
+		m.setFileCursorByDir(entries, parent)
+	}
+	m.ensureFileCursorVisible(entries)
+	return *m, nil
+}
+
+func (m *Model) handleFilesRight(entries []fileTreeEntry) (tea.Model, tea.Cmd) {
+	m.clampFileCursor(entries)
+	entry := entries[m.fileCursor]
+	if !entry.IsDir {
+		if entry.FileIndex >= 0 && entry.FileIndex < len(m.fileItems) {
+			if m.selected != entry.FileIndex || m.selectedF != entry.Path {
+				m.selected = entry.FileIndex
+				m.selectedF = entry.Path
+				m.loadingDiff = true
+				m.focus = focusDiff
+				return *m, m.loadDiffCmd(m.selectedF)
+			}
+			m.focus = focusDiff
+		}
+		return *m, nil
+	}
+
+	if m.isDirCollapsed(entry.Path) {
+		delete(m.treeCollapsed, entry.Path)
+	}
+
+	updated := m.fileTreeEntries()
+	dirIdx := -1
+	for i, e := range updated {
+		if e.IsDir && e.Path == entry.Path {
+			dirIdx = i
+			break
+		}
+	}
+	if dirIdx == -1 {
+		m.ensureFileCursorVisible(updated)
+		return *m, nil
+	}
+
+	dirDepth := updated[dirIdx].Depth
+	for i := dirIdx + 1; i < len(updated); i++ {
+		if updated[i].Depth <= dirDepth {
+			break
+		}
+		if updated[i].Depth == dirDepth+1 {
+			m.fileCursor = i
+			m.ensureFileCursorVisible(updated)
+			return m.updateSelectedFileFromCursor(updated)
+		}
+	}
+
+	m.ensureFileCursorVisible(updated)
+	return *m, nil
+}
+
+func (m *Model) clampFileCursor(entries []fileTreeEntry) {
+	if len(entries) == 0 {
+		m.fileCursor = 0
+		return
+	}
+	if m.fileCursor < 0 {
+		m.fileCursor = 0
+	}
+	if m.fileCursor >= len(entries) {
+		m.fileCursor = len(entries) - 1
+	}
+}
+
+func (m *Model) ensureFileCursorVisible(entries []fileTreeEntry) {
+	m.clampFileCursor(entries)
+	page := m.fileListPageSize()
+	if page < 1 {
+		page = 1
+	}
+	maxScroll := len(entries) - page
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.fileScroll < 0 {
+		m.fileScroll = 0
+	}
+	if m.fileScroll > maxScroll {
+		m.fileScroll = maxScroll
+	}
+	if m.fileCursor < m.fileScroll {
+		m.fileScroll = m.fileCursor
+	}
+	if m.fileCursor >= m.fileScroll+page {
+		m.fileScroll = m.fileCursor - page + 1
+	}
+	if m.fileScroll < 0 {
+		m.fileScroll = 0
+	}
+	if m.fileScroll > maxScroll {
+		m.fileScroll = maxScroll
+	}
+}
+
+func (m *Model) scrollFilesWindow(delta int, entries []fileTreeEntry) (tea.Model, tea.Cmd) {
+	if len(entries) == 0 || delta == 0 {
+		return *m, nil
+	}
+	page := m.fileListPageSize()
+	if page < 1 {
+		page = 1
+	}
+	maxScroll := len(entries) - page
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	oldTop := m.fileScroll
+	newTop := oldTop + delta
+	if newTop < 0 {
+		newTop = 0
+	}
+	if newTop > maxScroll {
+		newTop = maxScroll
+	}
+	if newTop == oldTop {
+		return *m, nil
+	}
+
+	rel := m.fileCursor - oldTop
+	if rel < 0 {
+		rel = 0
+	}
+	if rel >= page {
+		rel = page - 1
+	}
+	m.fileScroll = newTop
+	target := newTop + rel
+	if target < 0 {
+		target = 0
+	}
+	if target >= len(entries) {
+		target = len(entries) - 1
+	}
+	m.fileCursor = target
+	return m.updateSelectedFileFromCursor(entries)
+}
+
+func (m *Model) setFileCursorByDir(entries []fileTreeEntry, dirPath string) bool {
+	for i, e := range entries {
+		if e.IsDir && e.Path == dirPath {
+			m.fileCursor = i
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) setFileCursorByPath(entries []fileTreeEntry, path string) bool {
+	for i, e := range entries {
+		if !e.IsDir && e.Path == path {
+			m.fileCursor = i
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) isDirCollapsed(path string) bool {
+	return m.treeCollapsed[path]
+}
+
+func (m *Model) toggleDirCollapsed(path string) {
+	if m.treeCollapsed == nil {
+		m.treeCollapsed = make(map[string]bool)
+	}
+	if m.treeCollapsed[path] {
+		delete(m.treeCollapsed, path)
+		return
+	}
+	m.treeCollapsed[path] = true
+}
+
+func (m *Model) firstFilePathUnderDir(dirPath string) (string, bool) {
+	prefix := dirPath + "/"
+	for _, item := range m.fileItems {
+		if strings.HasPrefix(item.Path, prefix) {
+			return item.Path, true
+		}
+	}
+	return "", false
+}
+
+func (m *Model) expandDirsForFilePath(filePath string) {
+	if m.treeCollapsed == nil {
+		return
+	}
+	parts := strings.Split(strings.TrimSuffix(filePath, "/"), "/")
+	if len(parts) <= 1 {
+		return
+	}
+	cur := ""
+	for i := 0; i < len(parts)-1; i++ {
+		if cur == "" {
+			cur = parts[i]
+		} else {
+			cur = cur + "/" + parts[i]
+		}
+		delete(m.treeCollapsed, cur)
+	}
+}
+
+func parentDirPath(p string) string {
+	i := strings.LastIndex(p, "/")
+	if i <= 0 {
+		return ""
+	}
+	return p[:i]
+}
+
+func isRuneKey(msg tea.KeyMsg, key string) bool {
+	return msg.Type == tea.KeyRunes && msg.String() == key
+}
+
+func indexOfFilePath(items []gitint.FileItem, path string) int {
+	if path == "" {
+		return -1
+	}
+	for i, item := range items {
+		if item.Path == path {
+			return i
+		}
+	}
+	return -1
+}
+
+func (m *Model) syncFileCursorToSelectedPath() {
+	entries := m.fileTreeEntries()
+	if len(entries) == 0 {
+		m.fileCursor = 0
+		return
+	}
+	for i, e := range entries {
+		if !e.IsDir && e.Path == m.selectedF {
+			m.fileCursor = i
+			return
+		}
+	}
+	m.fileCursor = 0
+}
+
+func commentKey(c comments.Comment) string {
+	return comments.AnchorKey(c.Path, c.Side, c.Line)
+}
+
+func (m *Model) clampCommentsCursor(items []comments.Comment) {
+	if len(items) == 0 {
+		m.commentsCursor = 0
+		return
+	}
+	if m.commentsCursor < 0 {
+		m.commentsCursor = 0
+	}
+	if m.commentsCursor >= len(items) {
+		m.commentsCursor = len(items) - 1
+	}
+}
+
+func (m *Model) commentsPageSize() int {
+	if m.height <= 0 {
+		return 1
+	}
+	footerPlain := truncateLinesToWidth(m.helpText(), m.width)
+	footerHeight := lineCount(footerPlain)
+	dockHeight := 0
+	if m.commentInputActive {
+		dockHeight = lipgloss.Height(m.renderCommentDock())
+	} else if m.alertMsg != "" {
+		dockHeight = lipgloss.Height(m.renderAlertDock())
+	}
+	paneContentHeight := max(1, m.height-footerHeight-dockHeight-2)
+	listHeight := paneContentHeight - 2
+	if listHeight < 1 {
+		listHeight = 1
+	}
+	return listHeight
+}
+
+func (m *Model) ensureCommentsCursorVisible(items []comments.Comment) {
+	m.clampCommentsCursor(items)
+	page := m.commentsPageSize()
+	if page < 1 {
+		page = 1
+	}
+	maxScroll := len(items) - page
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.commentsScroll < 0 {
+		m.commentsScroll = 0
+	}
+	if m.commentsScroll > maxScroll {
+		m.commentsScroll = maxScroll
+	}
+	if m.commentsCursor < m.commentsScroll {
+		m.commentsScroll = m.commentsCursor
+	}
+	if m.commentsCursor >= m.commentsScroll+page {
+		m.commentsScroll = m.commentsCursor - page + 1
+	}
+	if m.commentsScroll < 0 {
+		m.commentsScroll = 0
+	}
+	if m.commentsScroll > maxScroll {
+		m.commentsScroll = maxScroll
+	}
+}
+
+func (m *Model) scrollCommentsWindow(delta int, items []comments.Comment) {
+	if len(items) == 0 || delta == 0 {
+		return
+	}
+	page := m.commentsPageSize()
+	if page < 1 {
+		page = 1
+	}
+	maxScroll := len(items) - page
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	oldTop := m.commentsScroll
+	newTop := oldTop + delta
+	if newTop < 0 {
+		newTop = 0
+	}
+	if newTop > maxScroll {
+		newTop = maxScroll
+	}
+	if newTop == oldTop {
+		return
+	}
+	rel := m.commentsCursor - oldTop
+	if rel < 0 {
+		rel = 0
+	}
+	if rel >= page {
+		rel = page - 1
+	}
+	m.commentsScroll = newTop
+	m.commentsCursor = newTop + rel
+	if m.commentsCursor >= len(items) {
+		m.commentsCursor = len(items) - 1
+	}
+}
+
+func (m *Model) pageComments(direction int, items []comments.Comment) {
+	if len(items) == 0 || direction == 0 {
+		return
+	}
+	page := m.commentsPageSize()
+	if page < 1 {
+		page = 1
+	}
+	step := page
+	if step > 1 {
+		step--
+	}
+	m.scrollCommentsWindow(direction*step, items)
+}
+
+func (m *Model) jumpToCommentInDiff(c comments.Comment) tea.Cmd {
+	anchor := commentAnchor{
+		Path: c.Path,
+		Side: c.Side,
+		Line: c.Line,
+	}
+	m.focus = focusDiff
+	m.pendingCommentJump = &anchor
+	if idx := indexOfFilePath(m.fileItems, c.Path); idx >= 0 {
+		m.selected = idx
+		m.selectedF = c.Path
+		m.syncFileCursorToSelectedPath()
+		m.ensureFileCursorVisible(m.fileTreeEntries())
+	}
+
+	if m.selectedF == c.Path && len(m.diffRows) > 0 && m.jumpToCommentAnchor(anchor) {
+		m.pendingCommentJump = nil
+		return nil
+	}
+	m.loadingDiff = true
+	return m.loadDiffCmd(c.Path)
+}
+
+func (m *Model) jumpToCommentAnchor(anchor commentAnchor) bool {
+	for i, row := range m.diffRows {
+		if row.Path != anchor.Path {
+			continue
+		}
+		switch anchor.Side {
+		case comments.SideOld:
+			if row.OldLine != nil && *row.OldLine == anchor.Line {
+				m.diffCursor = i
+				m.diffDirty = true
+				m.refreshDiffContent()
+				m.scrollCursorWithPadding(10)
+				return true
+			}
+		case comments.SideNew:
+			if row.NewLine != nil && *row.NewLine == anchor.Line {
+				m.diffCursor = i
+				m.diffDirty = true
+				m.refreshDiffContent()
+				m.scrollCursorWithPadding(10)
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (m Model) updateDiffPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if key.Matches(msg, m.keys.ToggleFiles) {
+	if key.Matches(msg, m.keys.ToggleFiles) || isRuneKey(msg, "l") {
 		m.toggleFilePaneHidden()
+		return m, nil
+	}
+	if isRuneKey(msg, "h") {
+		m.focus = focusFiles
+		m.ensureFilePaneVisible()
 		return m, nil
 	}
 
@@ -361,6 +975,22 @@ func (m Model) updateDiffPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keys.Down):
 		m.moveDiffCursor(1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.ScrollDown):
+		m.scrollDiffWindow(1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.ScrollUp):
+		m.scrollDiffWindow(-1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.PageDown):
+		m.pageDiff(1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.PageUp):
+		m.pageDiff(-1)
 		return m, nil
 
 	case key.Matches(msg, m.keys.Top):
@@ -394,8 +1024,8 @@ func (m Model) updateDiffPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Export):
-		if len(m.comments) == 0 {
-			m.alertMsg = "No comments to export."
+		if len(m.exportableComments()) == 0 {
+			m.setAlert("No non-stale comments to export.")
 			return m, nil
 		}
 		return m, m.exportCommentsCmd()
@@ -411,6 +1041,7 @@ func (m Model) handleCommentInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.commentInputModel.Blur()
 		m.commentInputErr = ""
 		m.commentEditAnchor = nil
+		m.commentEditKey = ""
 		return m, nil
 
 	case tea.KeyEnter:
@@ -447,7 +1078,7 @@ func (m Model) handleClearConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) saveCommentInput() tea.Cmd {
-	if m.commentEditAnchor == nil {
+	if m.commentEditAnchor == nil && m.commentEditKey == "" {
 		m.commentInputActive = false
 		m.commentInputModel.SetValue("")
 		m.commentInputModel.Blur()
@@ -458,6 +1089,29 @@ func (m *Model) saveCommentInput() tea.Cmd {
 	body := strings.TrimSpace(m.commentInputModel.Value())
 	if body == "" {
 		m.commentInputErr = "Comment text is empty."
+		return nil
+	}
+
+	if m.commentEditAnchor == nil && m.commentEditKey != "" {
+		existing, ok := m.comments[m.commentEditKey]
+		if !ok {
+			m.commentInputErr = "Comment no longer exists."
+			return nil
+		}
+		existing.Body = body
+		m.comments[m.commentEditKey] = existing
+		if err := m.persistComments(); err != nil {
+			m.commentInputErr = fmt.Sprintf("failed to save comment: %v", err)
+			return nil
+		}
+		m.commentInputActive = false
+		m.commentInputModel.SetValue("")
+		m.commentInputModel.Blur()
+		m.commentInputErr = ""
+		m.commentEditAnchor = nil
+		m.commentEditKey = ""
+		m.diffDirty = true
+		m.refreshDiffContent()
 		return nil
 	}
 
@@ -480,6 +1134,10 @@ func (m *Model) saveCommentInput() tea.Cmd {
 		ContextBefore: contextBefore,
 		ContextAfter:  contextAfter,
 	}
+	if m.commentStale == nil {
+		m.commentStale = make(map[string]bool)
+	}
+	m.commentStale[key] = false
 
 	if err := m.persistComments(); err != nil {
 		m.commentInputErr = fmt.Sprintf("failed to save comment: %v", err)
@@ -491,6 +1149,7 @@ func (m *Model) saveCommentInput() tea.Cmd {
 	m.commentInputModel.Blur()
 	m.commentInputErr = ""
 	m.commentEditAnchor = nil
+	m.commentEditKey = ""
 	m.diffDirty = true
 	m.refreshDiffContent()
 	return nil
@@ -499,14 +1158,14 @@ func (m *Model) saveCommentInput() tea.Cmd {
 func (m *Model) startCommentEdit(requireExisting bool) tea.Cmd {
 	anchor, ok := m.currentAnchor()
 	if !ok {
-		m.alertMsg = "No commentable line selected."
+		m.setAlert("No commentable line selected.")
 		return nil
 	}
 
 	key := comments.AnchorKey(anchor.Path, anchor.Side, anchor.Line)
 	existing, exists := m.comments[key]
 	if requireExisting && !exists {
-		m.alertMsg = "No comment exists on selected line."
+		m.setAlert("No comment exists on selected line.")
 		return nil
 	}
 
@@ -520,28 +1179,51 @@ func (m *Model) startCommentEdit(requireExisting bool) tea.Cmd {
 	m.commentInputModel.CursorEnd()
 	a := anchor
 	m.commentEditAnchor = &a
+	m.commentEditKey = key
+	return cmd
+}
+
+func (m *Model) startCommentEditByComment(c comments.Comment) tea.Cmd {
+	key := commentKey(c)
+	if _, ok := m.comments[key]; !ok {
+		m.setAlert("Comment no longer exists.")
+		return nil
+	}
+	m.commentInputActive = true
+	m.commentInputModel.SetValue(c.Body)
+	m.commentInputErr = ""
+	m.commentEditAnchor = nil
+	m.commentEditKey = key
+	cmd := m.commentInputModel.Focus()
+	m.commentInputModel.CursorEnd()
 	return cmd
 }
 
 func (m *Model) deleteCommentAtCursor() {
 	anchor, ok := m.currentAnchor()
 	if !ok {
-		m.alertMsg = "No commentable line selected."
+		m.setAlert("No commentable line selected.")
 		return
 	}
 
 	key := comments.AnchorKey(anchor.Path, anchor.Side, anchor.Line)
 	if _, exists := m.comments[key]; !exists {
-		m.alertMsg = "No comment exists on selected line."
+		m.setAlert("No comment exists on selected line.")
+		return
+	}
+	m.deleteCommentByKey(key)
+}
+
+func (m *Model) deleteCommentByKey(key string) {
+	if _, exists := m.comments[key]; !exists {
 		return
 	}
 	delete(m.comments, key)
-
+	delete(m.commentStale, key)
 	if err := m.persistComments(); err != nil {
-		m.alertMsg = fmt.Sprintf("failed to save comments: %v", err)
+		m.setAlert(fmt.Sprintf("failed to save comments: %v", err))
 		return
 	}
-
 	m.diffDirty = true
 	m.refreshDiffContent()
 }
@@ -551,10 +1233,13 @@ func (m *Model) clearAllComments() {
 		return
 	}
 	prev := m.comments
+	prevStale := m.commentStale
 	m.comments = make(map[string]comments.Comment)
+	m.commentStale = make(map[string]bool)
 	if err := m.persistComments(); err != nil {
 		m.comments = prev
-		m.alertMsg = fmt.Sprintf("failed to clear comments: %v", err)
+		m.commentStale = prevStale
+		m.setAlert(fmt.Sprintf("failed to clear comments: %v", err))
 		return
 	}
 	m.diffDirty = true
@@ -564,7 +1249,7 @@ func (m *Model) clearAllComments() {
 func (m *Model) jumpToComment(direction int) {
 	rows := m.commentRowIndices()
 	if len(rows) == 0 {
-		m.alertMsg = "No comments in current diff."
+		m.setAlert("No comments in current diff.")
 		return
 	}
 
@@ -598,19 +1283,21 @@ func (m Model) View() string {
 		return "Loading..."
 	}
 
-	help := "tab focus | h/l focus panes | j/k move | enter open diff | z zoom/hide files | t mode | c/e/d comment | n/p comment nav | y export | C clear all | r refresh | ? help | q quit"
-	if m.helpOpen {
-		help = strings.Join([]string{
-			"Global: q quit, tab switch focus, h files focus, l diff focus, t toggle diff mode, C clear all comments, ? toggle help",
-			"Files pane: j/k move, enter open diff, z toggle file pane width, r refresh",
-			"Diff pane: j/k move cursor, g/G top/bottom, z hide/show file list",
-			"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard",
-		}, "\n")
-	}
+	help := m.helpText()
 
-	footerPlain := truncateLinesToWidth(help, m.width)
-	footerHeight := lineCount(footerPlain)
-	footer := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(footerPlain)
+	footerHelpPlain := truncateLinesToWidth(help, m.width)
+	footerLines := []string{
+		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(footerHelpPlain),
+	}
+	if staleCount := m.staleCommentCount(); staleCount > 0 {
+		warn := truncateLinesToWidth(
+			fmt.Sprintf("Warning: %d stale comment(s). They are marked with ! and excluded from export.", staleCount),
+			m.width,
+		)
+		footerLines = append(footerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true).Render(warn))
+	}
+	footer := strings.Join(footerLines, "\n")
+	footerHeight := lipgloss.Height(footer)
 
 	dock := ""
 	dockHeight := 0
@@ -637,11 +1324,16 @@ func (m Model) View() string {
 	m.newView.Height = max(1, paneContentHeight-4)
 	m.refreshDiffContent()
 
-	rightPane := m.renderDiffPanes(oldPaneW, newPaneW, paneContentHeight)
-	content := rightPane
-	if !m.fileHidden {
-		leftPane := m.renderFilesPane(leftW, paneContentHeight)
-		content = lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
+	content := ""
+	if m.focus == focusComments {
+		content = m.renderCommentsPane(m.width, paneContentHeight)
+	} else {
+		rightPane := m.renderDiffPanes(oldPaneW, newPaneW, paneContentHeight)
+		content = rightPane
+		if !m.fileHidden {
+			leftPane := m.renderFilesPane(leftW, paneContentHeight)
+			content = lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
+		}
 	}
 
 	body := content
@@ -652,6 +1344,39 @@ func (m Model) View() string {
 		body = overlayCentered(body, m.renderClearAllConfirmModal(), m.width, lipgloss.Height(body))
 	}
 	return lipgloss.JoinVertical(lipgloss.Left, body, footer)
+}
+
+func (m Model) helpText() string {
+	if !m.helpOpen {
+		return "tab focus | m comments view | j/k move | ctrl-f/b page | ctrl-e/y scroll | enter open diff | z zoom/hide files | t mode | c/e/d comment | n/p comment nav | y export | C clear all | r refresh | ? help | q quit"
+	}
+	return strings.Join([]string{
+		"Global: q quit, tab switch focus, m comments view, t toggle diff mode, C clear all comments, ? toggle help",
+		"Files pane: j/k move, ctrl-e/ctrl-y scroll, h/l tree nav, enter open diff, z toggle file pane width, r refresh",
+		"Diff pane: j/k move cursor, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, h focus files, z/l hide/show file list",
+		"Comments view: j/k move, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, e edit, d delete, enter jump to diff",
+		"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard",
+	}, "\n")
+}
+
+func (m *Model) fileListPageSize() int {
+	if m.height <= 0 {
+		return 1
+	}
+	footerPlain := truncateLinesToWidth(m.helpText(), m.width)
+	footerHeight := lineCount(footerPlain)
+	dockHeight := 0
+	if m.commentInputActive {
+		dockHeight = lipgloss.Height(m.renderCommentDock())
+	} else if m.alertMsg != "" {
+		dockHeight = lipgloss.Height(m.renderAlertDock())
+	}
+	paneContentHeight := max(1, m.height-footerHeight-dockHeight-2)
+	listHeight := paneContentHeight - 2
+	if listHeight < 1 {
+		listHeight = 1
+	}
+	return listHeight
 }
 
 func (m Model) renderCommentDock() string {
@@ -685,7 +1410,7 @@ func (m Model) renderCommentDock() string {
 }
 
 func (m Model) renderAlertDock() string {
-	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Press any key to dismiss")
+	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Auto-hides after 3s")
 	body := strings.Join([]string{
 		m.alertMsg,
 		"",
@@ -772,17 +1497,64 @@ func (m Model) renderFilesPane(width, height int) string {
 	bodyLines = append(bodyLines, title)
 	bodyLines = append(bodyLines, "")
 
-	if len(m.fileItems) == 0 {
+	entries := m.fileTreeEntries()
+	cursor := m.fileCursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= len(entries) {
+		cursor = len(entries) - 1
+	}
+
+	if len(entries) == 0 {
 		bodyLines = append(bodyLines, "No changed files")
 	} else {
-		for i, item := range m.fileItems {
+		pageSize := m.fileListPageSize()
+		if pageSize < 1 {
+			pageSize = 1
+		}
+		maxScroll := len(entries) - pageSize
+		if maxScroll < 0 {
+			maxScroll = 0
+		}
+		start := m.fileScroll
+		if start < 0 {
+			start = 0
+		}
+		if start > maxScroll {
+			start = maxScroll
+		}
+		end := start + pageSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+
+		for i := start; i < end; i++ {
+			entry := entries[i]
 			prefix := "  "
-			if i == m.selected {
+			if i == cursor {
 				prefix = "> "
 			}
-			line := fmt.Sprintf("%s[%s] %s", prefix, item.Status, item.Path)
+			indent := strings.Repeat("  ", entry.Depth)
+			line := ""
+			if entry.IsDir {
+				icon := "[-]"
+				if m.isDirCollapsed(entry.Path) {
+					icon = "[+]"
+				}
+				line = fmt.Sprintf("%s%s%s %s/", prefix, indent, icon, entry.Name)
+			} else {
+				commentMark := " "
+				if entry.HasComment {
+					commentMark = "C"
+				}
+				line = fmt.Sprintf("%s%s%s [%s] %s", prefix, indent, commentMark, entry.Status, entry.Name)
+			}
 			lineStyle := lipgloss.NewStyle().Width(innerW).MaxWidth(innerW)
-			if i == m.selected {
+			if entry.IsDir {
+				lineStyle = lineStyle.Foreground(lipgloss.Color("244"))
+			}
+			if i == cursor {
 				lineStyle = lineStyle.Foreground(lipgloss.Color("39")).Bold(true)
 			}
 			bodyLines = append(bodyLines, lineStyle.Render(line))
@@ -795,6 +1567,197 @@ func (m Model) renderFilesPane(width, height int) string {
 	}
 
 	return paneStyle.Render(strings.Join(bodyLines, "\n"))
+}
+
+func (m Model) renderCommentsPane(width, height int) string {
+	border := lipgloss.NormalBorder()
+	borderColor := lipgloss.Color("245")
+	if m.focus == focusComments {
+		borderColor = lipgloss.Color("39")
+	}
+	contentW := max(1, width-2)
+	paneStyle := lipgloss.NewStyle().
+		Width(contentW).
+		Height(max(1, height)).
+		Border(border).
+		BorderForeground(borderColor)
+
+	items := m.sortedComments()
+	cursor := m.commentsCursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= len(items) {
+		cursor = len(items) - 1
+	}
+
+	bodyLines := make([]string, 0, len(items)+2)
+	title := fmt.Sprintf("Comments (%d)", len(items))
+	bodyLines = append(bodyLines, title)
+	bodyLines = append(bodyLines, "")
+	if len(items) == 0 {
+		bodyLines = append(bodyLines, "No comments")
+		return paneStyle.Render(strings.Join(bodyLines, "\n"))
+	}
+
+	pageSize := m.commentsPageSize()
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	maxScroll := len(items) - pageSize
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	start := m.commentsScroll
+	if start < 0 {
+		start = 0
+	}
+	if start > maxScroll {
+		start = maxScroll
+	}
+	end := start + pageSize
+	if end > len(items) {
+		end = len(items)
+	}
+
+	innerW := max(1, contentW)
+	for i := start; i < end; i++ {
+		c := items[i]
+		prefix := "  "
+		if i == cursor {
+			prefix = "> "
+		}
+		side := c.Side.String()
+		summary := strings.ReplaceAll(strings.TrimSpace(c.Body), "\n", " / ")
+		staleMark := " "
+		if m.isCommentStale(c) {
+			staleMark = "!"
+		}
+		line := fmt.Sprintf("%s%s %s:%s:%d | %s", prefix, staleMark, c.Path, side, c.Line, summary)
+		style := lipgloss.NewStyle().Width(innerW).MaxWidth(innerW)
+		if i == cursor {
+			style = style.Foreground(lipgloss.Color("39")).Bold(true)
+		} else if staleMark == "!" {
+			style = style.Foreground(lipgloss.Color("214"))
+		}
+		bodyLines = append(bodyLines, style.Render(line))
+	}
+	return paneStyle.Render(strings.Join(bodyLines, "\n"))
+}
+
+type fileTreeEntry struct {
+	Path       string
+	Name       string
+	Depth      int
+	IsDir      bool
+	FileIndex  int
+	Status     string
+	HasComment bool
+}
+
+type fileTreeDir struct {
+	Name  string
+	Path  string
+	Dirs  map[string]*fileTreeDir
+	Files []fileTreeFile
+}
+
+type fileTreeFile struct {
+	Name       string
+	Path       string
+	FileIndex  int
+	Status     string
+	HasComment bool
+}
+
+func (m Model) commentedPaths() map[string]bool {
+	out := make(map[string]bool, len(m.comments))
+	for _, c := range m.comments {
+		out[c.Path] = true
+	}
+	return out
+}
+
+func (m Model) fileTreeEntries() []fileTreeEntry {
+	root := &fileTreeDir{
+		Name: "",
+		Path: "",
+		Dirs: make(map[string]*fileTreeDir),
+	}
+	commented := m.commentedPaths()
+	for i, item := range m.fileItems {
+		parts := strings.Split(strings.TrimSuffix(item.Path, "/"), "/")
+		if len(parts) == 0 || parts[0] == "" {
+			continue
+		}
+		node := root
+		for d := 0; d < len(parts)-1; d++ {
+			name := parts[d]
+			child, ok := node.Dirs[name]
+			if !ok {
+				path := name
+				if node.Path != "" {
+					path = node.Path + "/" + name
+				}
+				child = &fileTreeDir{
+					Name: name,
+					Path: path,
+					Dirs: make(map[string]*fileTreeDir),
+				}
+				node.Dirs[name] = child
+			}
+			node = child
+		}
+		name := parts[len(parts)-1]
+		node.Files = append(node.Files, fileTreeFile{
+			Name:       name,
+			Path:       item.Path,
+			FileIndex:  i,
+			Status:     item.Status,
+			HasComment: commented[item.Path],
+		})
+	}
+
+	out := make([]fileTreeEntry, 0, len(m.fileItems)*2)
+	flattenTreeEntries(root, 0, m.treeCollapsed, &out)
+	return out
+}
+
+func flattenTreeEntries(node *fileTreeDir, depth int, collapsed map[string]bool, out *[]fileTreeEntry) {
+	dirNames := make([]string, 0, len(node.Dirs))
+	for name := range node.Dirs {
+		dirNames = append(dirNames, name)
+	}
+	sort.Strings(dirNames)
+	for _, name := range dirNames {
+		child := node.Dirs[name]
+		*out = append(*out, fileTreeEntry{
+			Path:      child.Path,
+			Name:      child.Name,
+			Depth:     depth,
+			IsDir:     true,
+			FileIndex: -1,
+		})
+		if collapsed != nil && collapsed[child.Path] {
+			continue
+		}
+		flattenTreeEntries(child, depth+1, collapsed, out)
+	}
+
+	sort.Slice(node.Files, func(i, j int) bool {
+		return node.Files[i].Name < node.Files[j].Name
+	})
+	for _, f := range node.Files {
+		*out = append(*out, fileTreeEntry{
+			Path:       f.Path,
+			Name:       f.Name,
+			Depth:      depth,
+			IsDir:      false,
+			FileIndex:  f.FileIndex,
+			Status:     f.Status,
+			HasComment: f.HasComment,
+		})
+	}
 }
 
 func (m Model) renderDiffPanes(oldWidth, newWidth, height int) string {
@@ -850,6 +1813,20 @@ func (m Model) loadFilesCmd() tea.Cmd {
 	}
 }
 
+func (m Model) loadCommentStaleCmd(items []gitint.FileItem, commentMap map[string]comments.Comment, mode gitint.DiffMode) tea.Cmd {
+	cwd := m.cwd
+	service := m.diffSvc
+	itemSnapshot := append([]gitint.FileItem(nil), items...)
+	commentSnapshot := make([]comments.Comment, 0, len(commentMap))
+	for _, c := range commentMap {
+		commentSnapshot = append(commentSnapshot, c)
+	}
+	return func() tea.Msg {
+		stale, err := buildCommentStaleMap(context.Background(), cwd, service, itemSnapshot, commentSnapshot, mode)
+		return commentStaleLoadedMsg{stale: stale, err: err}
+	}
+}
+
 func (m Model) loadDiffCmd(path string) tea.Cmd {
 	cwd := m.cwd
 	service := m.diffSvc
@@ -872,11 +1849,9 @@ func (m Model) loadDiffCmd(path string) tea.Cmd {
 }
 
 func (m Model) exportCommentsCmd() tea.Cmd {
-	snapshot := m.sortedComments()
-	mode := m.diffMode
+	snapshot := m.exportableComments()
 	return func() tea.Msg {
-		title := fmt.Sprintf("Review comments (%s diff mode):", mode.String())
-		text := comments.ExportPlain(snapshot, title)
+		text := comments.ExportPlain(snapshot, "Review comments:")
 		err := clipboard.CopyText(context.Background(), text)
 		return clipboardResultMsg{err: err}
 	}
@@ -896,6 +1871,113 @@ func (m *Model) moveDiffCursor(delta int) {
 	}
 	m.diffDirty = true
 	m.refreshDiffContent()
+}
+
+func (m *Model) pageDiff(direction int) {
+	if len(m.diffRows) == 0 {
+		return
+	}
+	if direction == 0 {
+		return
+	}
+
+	visible := m.oldView.VisibleLineCount()
+	if nv := m.newView.VisibleLineCount(); nv < visible || visible <= 0 {
+		visible = nv
+	}
+	if visible <= 0 {
+		visible = m.oldView.Height
+		if m.newView.Height < visible || visible <= 0 {
+			visible = m.newView.Height
+		}
+	}
+	if visible <= 0 {
+		return
+	}
+
+	total := m.oldView.TotalLineCount()
+	if n := m.newView.TotalLineCount(); n > total {
+		total = n
+	}
+	if total <= 0 {
+		return
+	}
+
+	maxTop := total - visible
+	if maxTop < 0 {
+		maxTop = 0
+	}
+	step := visible
+	if step > 1 {
+		// Viewport's visible count includes one extra slot for paging here;
+		// subtract one so we don't skip the first line of the next page.
+		step--
+	}
+	targetTop := m.oldView.YOffset + direction*step
+	if targetTop < 0 {
+		targetTop = 0
+	}
+	if targetTop > maxTop {
+		targetTop = maxTop
+	}
+
+	m.diffCursor = m.rowIndexForVisualLine(targetTop)
+	m.diffDirty = true
+	m.refreshDiffContent()
+	m.oldView.SetYOffset(targetTop)
+	m.newView.SetYOffset(targetTop)
+}
+
+func (m *Model) scrollDiffWindow(delta int) {
+	if delta == 0 || len(m.diffRows) == 0 {
+		return
+	}
+	visible := m.oldView.VisibleLineCount()
+	if nv := m.newView.VisibleLineCount(); nv < visible || visible <= 0 {
+		visible = nv
+	}
+	if visible <= 0 {
+		visible = 1
+	}
+
+	total := m.oldView.TotalLineCount()
+	if n := m.newView.TotalLineCount(); n > total {
+		total = n
+	}
+	if total <= 0 {
+		return
+	}
+
+	oldTop := m.oldView.YOffset
+	maxTop := total - visible
+	if maxTop < 0 {
+		maxTop = 0
+	}
+	newTop := oldTop + delta
+	if newTop < 0 {
+		newTop = 0
+	}
+	if newTop > maxTop {
+		newTop = maxTop
+	}
+	if newTop == oldTop {
+		return
+	}
+
+	start, _ := m.cursorVisualRange()
+	rel := start - oldTop
+	if rel < 0 {
+		rel = 0
+	}
+	if rel >= visible {
+		rel = visible - 1
+	}
+	targetLine := newTop + rel
+	m.diffCursor = m.rowIndexForVisualLine(targetLine)
+	m.diffDirty = true
+	m.refreshDiffContent()
+	m.oldView.SetYOffset(newTop)
+	m.newView.SetYOffset(newTop)
 }
 
 func (m *Model) toggleFilePaneWidth() {
@@ -1053,6 +2135,26 @@ func (m *Model) cursorVisualRange() (int, int) {
 	return start, start + height - 1
 }
 
+func (m *Model) rowIndexForVisualLine(line int) int {
+	if len(m.rowStarts) != len(m.diffRows) || len(m.rowHeights) != len(m.diffRows) {
+		return m.diffCursor
+	}
+	if line <= 0 {
+		return 0
+	}
+	for i := 0; i < len(m.rowStarts); i++ {
+		start := m.rowStarts[i]
+		height := m.rowHeights[i]
+		if height <= 0 {
+			height = 1
+		}
+		if line >= start && line < start+height {
+			return i
+		}
+	}
+	return len(m.diffRows) - 1
+}
+
 func (m *Model) clampDiffCursor() {
 	if len(m.diffRows) == 0 {
 		m.diffCursor = 0
@@ -1142,6 +2244,40 @@ func (m Model) sortedComments() []comments.Comment {
 		}
 		return out[i].CreatedAt.Before(out[j].CreatedAt)
 	})
+	return out
+}
+
+func (m Model) exportableComments() []comments.Comment {
+	all := m.sortedComments()
+	out := make([]comments.Comment, 0, len(all))
+	for _, c := range all {
+		if m.isCommentStale(c) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+func (m Model) isCommentStale(c comments.Comment) bool {
+	return m.commentStale[commentKey(c)]
+}
+
+func (m Model) staleCommentCount() int {
+	n := 0
+	for _, stale := range m.commentStale {
+		if stale {
+			n++
+		}
+	}
+	return n
+}
+
+func (m Model) staleAllComments() map[string]bool {
+	out := make(map[string]bool, len(m.comments))
+	for _, c := range m.comments {
+		out[commentKey(c)] = true
+	}
 	return out
 }
 
@@ -1327,6 +2463,17 @@ func overlayLine(baseLine, overlayLine string, x, overlayW, totalW int) string {
 	return left + overlayLine + right
 }
 
+func alertTickCmd() tea.Cmd {
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
+		return alertTickMsg{}
+	})
+}
+
+func (m *Model) setAlert(msg string) {
+	m.alertMsg = msg
+	m.alertUntil = time.Now().Add(3 * time.Second)
+}
+
 func truncateLinesToWidth(text string, width int) string {
 	if width <= 0 {
 		return ""
@@ -1347,4 +2494,86 @@ func lineCount(text string) int {
 		return 0
 	}
 	return strings.Count(text, "\n") + 1
+}
+
+func buildCommentStaleMap(
+	ctx context.Context,
+	cwd string,
+	diffSvc gitint.DiffService,
+	items []gitint.FileItem,
+	allComments []comments.Comment,
+	mode gitint.DiffMode,
+) (map[string]bool, error) {
+	stale := make(map[string]bool, len(allComments))
+	if len(allComments) == 0 {
+		return stale, nil
+	}
+
+	fileSet := make(map[string]bool, len(items))
+	for _, it := range items {
+		fileSet[it.Path] = true
+	}
+
+	byPath := make(map[string][]comments.Comment)
+	for _, c := range allComments {
+		k := commentKey(c)
+		if !fileSet[c.Path] {
+			stale[k] = true
+			continue
+		}
+		byPath[c.Path] = append(byPath[c.Path], c)
+	}
+
+	var firstErr error
+	for path, group := range byPath {
+		d, err := diffSvc.Diff(ctx, cwd, path, mode)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			for _, c := range group {
+				stale[commentKey(c)] = true
+			}
+			continue
+		}
+		if strings.TrimSpace(d) == "" {
+			for _, c := range group {
+				stale[commentKey(c)] = true
+			}
+			continue
+		}
+
+		rows, err := diffview.ParseUnifiedDiff([]byte(d))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			for _, c := range group {
+				stale[commentKey(c)] = true
+			}
+			continue
+		}
+
+		oldLines := make(map[int]bool)
+		newLines := make(map[int]bool)
+		for _, r := range rows {
+			if r.OldLine != nil {
+				oldLines[*r.OldLine] = true
+			}
+			if r.NewLine != nil {
+				newLines[*r.NewLine] = true
+			}
+		}
+		for _, c := range group {
+			k := commentKey(c)
+			switch c.Side {
+			case comments.SideOld:
+				stale[k] = !oldLines[c.Line]
+			default:
+				stale[k] = !newLines[c.Line]
+			}
+		}
+	}
+
+	return stale, firstErr
 }
