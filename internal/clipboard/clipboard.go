@@ -4,7 +4,7 @@ import (
 	"context"
 	"runtime"
 
-	"lediff/internal/util"
+	"diffman/internal/util"
 )
 
 func CopyText(ctx context.Context, text string) error {

@@ -1,4 +1,4 @@
-module lediff
+module diffman
 
 go 1.26.0
 

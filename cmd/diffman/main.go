@@ -6,7 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"lediff/internal/app"
+	"diffman/internal/app"
 )
 
 func main() {

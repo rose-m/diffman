@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"lediff/internal/util"
+	"diffman/internal/util"
 )
 
 func DiscoverRepoRoot(ctx context.Context, cwd string) (string, error) {

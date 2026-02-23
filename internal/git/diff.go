@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"lediff/internal/util"
+	"diffman/internal/util"
 )
 
 type DiffMode int

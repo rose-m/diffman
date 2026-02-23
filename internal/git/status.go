@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"lediff/internal/util"
+	"diffman/internal/util"
 )
 
 // FileItem is one changed file from git status.

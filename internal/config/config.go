@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	configDirName  = "lediff"
+	configDirName  = "diffman"
 	configFileName = "config.json"
 )
 

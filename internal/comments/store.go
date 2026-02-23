@@ -12,7 +12,7 @@ type Store struct {
 }
 
 func NewStore(gitDir string) Store {
-	return Store{path: filepath.Join(gitDir, ".lediff", "comments.json")}
+	return Store{path: filepath.Join(gitDir, ".diffman", "comments.json")}
 }
 
 func (s Store) Load() ([]Comment, error) {

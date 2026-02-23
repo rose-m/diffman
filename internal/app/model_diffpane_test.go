@@ -5,7 +5,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/viewport"
 
-	"lediff/internal/diffview"
+	"diffman/internal/diffview"
 )
 
 func TestDiffPaneModeNewOnly(t *testing.T) {

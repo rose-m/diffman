@@ -1,6 +1,6 @@
-# lediff
+# diffman
 
-`lediff` is a terminal UI for reviewing git diffs and attaching per-line review comments.
+`diffman` is a terminal UI for reviewing git diffs and attaching per-line review comments.
 
 It is built with Bubble Tea and designed for fast keyboard-driven review.
 
@@ -39,13 +39,13 @@ make lint
 
 ## Quick Start
 
-Run `lediff` anywhere inside a git repository:
+Run `diffman` anywhere inside a git repository:
 
 ```bash
-lediff
+diffman
 ```
 
-`lediff` discovers the repository root automatically and shows changed files.
+`diffman` discovers the repository root automatically and shows changed files.
 
 ## UI Overview
 
@@ -115,7 +115,7 @@ Directory navigation behavior:
 
 Comments are saved in the repo git directory:
 
-- `.git/.lediff/comments.json`
+- `.git/.diffman/comments.json`
 
 Each comment is anchored by:
 
@@ -123,7 +123,7 @@ Each comment is anchored by:
 - side (`old` or `new`)
 - line number
 
-`lediff` shows inline comment text beneath the commented line in diff panes.
+`diffman` shows inline comment text beneath the commented line in diff panes.
 
 ## Stale Comments
 
@@ -153,8 +153,8 @@ For one-sided changes:
 
 Configure custom command shortcuts in:
 
-- `~/.config/lediff/config.json`
-- or `$XDG_CONFIG_HOME/lediff/config.json` if `XDG_CONFIG_HOME` is set
+- `$HOME/.config/diffman/config.json`
+- or `$XDG_CONFIG_HOME/diffman/config.json` if `XDG_CONFIG_HOME` is set
 
 Format:
 
@@ -178,7 +178,7 @@ Environment variables provided to leader commands:
 - `ROOT`: absolute repository root
 - `FILE`: currently selected file path (repo-relative)
 
-After a leader command exits, `lediff` auto-refreshes file/diff state.
+After a leader command exits, `diffman` auto-refreshes file/diff state.
 
 ## Clipboard Export Format
 
@@ -194,6 +194,6 @@ With context block per comment when available.
 
 ## Notes
 
-- `lediff` only shows files reported as changed by `git status`.
+- `diffman` only shows files reported as changed by `git status`.
 - Running outside a git repository will fail at startup.
 - If config parsing fails, the app still starts and shows an alert.

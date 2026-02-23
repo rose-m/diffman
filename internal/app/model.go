@@ -16,11 +16,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"lediff/internal/clipboard"
-	"lediff/internal/comments"
-	"lediff/internal/config"
-	"lediff/internal/diffview"
-	gitint "lediff/internal/git"
+	"diffman/internal/clipboard"
+	"diffman/internal/comments"
+	"diffman/internal/config"
+	"diffman/internal/diffview"
+	gitint "diffman/internal/git"
 )
 
 type focusPane int
@@ -1444,7 +1444,7 @@ func (m Model) helpText() string {
 	}
 	return strings.Join([]string{
 		"Global: q quit, tab switch focus, m comments view, t toggle diff mode, C clear all comments, ? toggle help",
-		"Leader: <space><key> runs configured command from ~/.config/lediff/config.json",
+		"Leader: <space><key> runs configured command from ~/.config/diffman/config.json",
 		"Files pane: j/k move, ctrl-e/ctrl-y scroll, h/l tree nav, enter open diff, z toggle file pane width, r refresh",
 		"Diff pane: j/k move cursor, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, h focus files, z/l hide/show file list",
 		"Comments view: j/k move, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, e edit, d delete, enter jump to diff",

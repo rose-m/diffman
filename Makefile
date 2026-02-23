@@ -1,6 +1,6 @@
 GO ?= go
 BINDIR ?= $(HOME)/.local/bin
-BINARY ?= lediff
+BINARY ?= diffman
 BUILD_DIR ?= ./bin
 BUILD_OUT ?= $(BUILD_DIR)/$(BINARY)
 
@@ -19,11 +19,11 @@ lint:
 	$(GO) vet ./...
 
 run:
-	$(GO) run ./cmd/lediff
+	$(GO) run ./cmd/diffman
 
 build:
 	mkdir -p "$(BUILD_DIR)"
-	$(GO) build -o "$(BUILD_OUT)" ./cmd/lediff
+	$(GO) build -o "$(BUILD_OUT)" ./cmd/diffman
 
 install: build
 	mkdir -p "$(BINDIR)"

@@ -57,7 +57,7 @@ func TestDefaultPathUsesXDGConfigHome(t *testing.T) {
 		t.Fatalf("DefaultPath() error = %v", err)
 	}
 
-	want := filepath.Join(xdg, "lediff", "config.json")
+	want := filepath.Join(xdg, "diffman", "config.json")
 	if got != want {
 		t.Fatalf("DefaultPath()=%q want %q", got, want)
 	}
