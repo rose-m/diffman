@@ -136,6 +136,7 @@ type Model struct {
 	err          error
 }
 
+// Test
 func NewModel() (Model, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -316,7 +317,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.setAlert(fmt.Sprintf("leader %s failed: %v", msg.key, msg.err))
 		}
-		return m, nil
+		m.loadingFiles = true
+		return m, m.loadFilesCmd()
 
 	case tea.KeyMsg:
 		if m.commentInputActive {
