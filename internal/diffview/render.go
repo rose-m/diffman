@@ -244,11 +244,11 @@ func renderRowSegments(
 func renderGutterPrefix(isCursor, hasComment bool) string {
 	cursorMark := " "
 	if isCursor {
-		cursorMark = ">"
+		cursorMark = "▸"
 	}
 	commentMark := " "
 	if hasComment {
-		commentMark = "C"
+		commentMark = "◉"
 	}
 	marks := cursorMark + commentMark
 

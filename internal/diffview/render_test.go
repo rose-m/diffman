@@ -25,10 +25,10 @@ func TestRenderSplitIncludesCursorAndSideCommentMarkers(t *testing.T) {
 		t.Fatalf("line counts mismatch old=%d new=%d rows=%d", len(oldLines), len(newLines), len(rows))
 	}
 
-	if !strings.HasPrefix(stripANSI(oldLines[1]), ">C ") {
+	if !strings.HasPrefix(stripANSI(oldLines[1]), "▸◉ ") {
 		t.Fatalf("expected cursor+comment marker on old row 1, got %q", oldLines[1])
 	}
-	if !strings.HasPrefix(stripANSI(newLines[1]), ">C ") {
+	if !strings.HasPrefix(stripANSI(newLines[1]), "▸◉ ") {
 		t.Fatalf("expected cursor+comment marker on new row 1, got %q", newLines[1])
 	}
 
@@ -59,7 +59,7 @@ func TestRenderSplitUsesAddRemoveMarkersForSingleSidedRows(t *testing.T) {
 	if !strings.Contains(old0, "-   5 gone") {
 		t.Fatalf("expected removed marker in old pane, got %q", old0)
 	}
-	if strings.TrimSpace(new0) != ">" {
+	if strings.TrimSpace(new0) != "▸" {
 		t.Fatalf("expected blank new-side delete row except cursor prefix, got %q", new0)
 	}
 
@@ -189,10 +189,10 @@ func TestRenderSplitShowsCommentMarkerOnBothPanes(t *testing.T) {
 		return path == "a.txt" && line == 4 && side == SideNew
 	})
 
-	if !strings.HasPrefix(stripANSI(out.OldLines[0]), ">C ") {
+	if !strings.HasPrefix(stripANSI(out.OldLines[0]), "▸◉ ") {
 		t.Fatalf("expected comment marker on old pane row, got %q", stripANSI(out.OldLines[0]))
 	}
-	if !strings.HasPrefix(stripANSI(out.NewLines[0]), ">C ") {
+	if !strings.HasPrefix(stripANSI(out.NewLines[0]), "▸◉ ") {
 		t.Fatalf("expected comment marker on new pane row, got %q", stripANSI(out.NewLines[0]))
 	}
 }

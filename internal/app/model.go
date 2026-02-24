@@ -477,6 +477,9 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case key.Matches(msg, m.keys.Export):
+		return m.handleExportComments()
+
 	}
 
 	return m, nil
@@ -572,6 +575,9 @@ func (m Model) updateCommentsPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.jumpToCommentInDiff(items[m.commentsCursor])
+
+	case key.Matches(msg, m.keys.Export):
+		return m.handleExportComments()
 	}
 
 	return m, nil
@@ -1106,13 +1112,17 @@ func (m Model) updateDiffPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case key.Matches(msg, m.keys.Export):
-		if len(m.exportableComments()) == 0 {
-			m.setAlert("No non-stale comments to export.")
-			return m, nil
-		}
-		return m, m.exportCommentsCmd()
+		return m.handleExportComments()
 	}
 	return m, nil
+}
+
+func (m Model) handleExportComments() (tea.Model, tea.Cmd) {
+	if len(m.exportableComments()) == 0 {
+		m.setAlert("No non-stale comments to export.")
+		return m, nil
+	}
+	return m, m.exportCommentsCmd()
 }
 
 func (m Model) handleCommentInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1373,7 +1383,7 @@ func (m Model) View() string {
 	}
 	if staleCount := m.staleCommentCount(); staleCount > 0 {
 		warn := truncateLinesToWidth(
-			fmt.Sprintf("Warning: %d stale comment(s). They are marked with ! and excluded from export.", staleCount),
+			fmt.Sprintf("Warning: %d stale comment(s). They are marked with ⚠ and excluded from export.", staleCount),
 			m.width,
 		)
 		footerLines = append(footerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true).Render(warn))
@@ -1586,6 +1596,7 @@ func (m Model) renderFilesPane(width, height int) string {
 	}
 
 	innerW := max(1, width)
+	commentMarkStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("141")).Bold(true)
 	bodyLines := make([]string, 0, len(m.fileItems)+2)
 	bodyLines = append(bodyLines, title)
 	bodyLines = append(bodyLines, "")
@@ -1631,17 +1642,17 @@ func (m Model) renderFilesPane(width, height int) string {
 			indent := strings.Repeat("  ", entry.Depth)
 			line := ""
 			if entry.IsDir {
-				icon := "[-]"
+				icon := ""
 				if m.isDirCollapsed(entry.Path) {
-					icon = "[+]"
+					icon = ""
 				}
 				line = fmt.Sprintf("%s%s%s %s/", prefix, indent, icon, entry.Name)
 			} else {
-				commentMark := " "
+				commentMark := "  "
 				if entry.HasComment {
-					commentMark = "C"
+					commentMark = commentMarkStyle.Render("✎ ")
 				}
-				line = fmt.Sprintf("%s%s%s [%s] %s", prefix, indent, commentMark, entry.Status, entry.Name)
+				line = fmt.Sprintf("%s%s%s%s %s", prefix, indent, commentMark, fileStatusSymbol(entry.Status), entry.Name)
 			}
 			line = ansi.Truncate(line, innerW, "")
 			lineStyle := lipgloss.NewStyle().Width(innerW).MaxWidth(innerW)
@@ -1723,20 +1734,40 @@ func (m Model) renderCommentsPane(width, height int) string {
 		}
 		side := c.Side.String()
 		summary := strings.ReplaceAll(strings.TrimSpace(c.Body), "\n", " / ")
-		staleMark := " "
-		if m.isCommentStale(c) {
-			staleMark = "!"
+		stale := m.isCommentStale(c)
+		statusMark := "✓"
+		if stale {
+			statusMark = "⚠"
 		}
-		line := fmt.Sprintf("%s%s %s:%s:%d | %s", prefix, staleMark, c.Path, side, c.Line, summary)
+		line := fmt.Sprintf("%s%s %s:%s:%d | %s", prefix, statusMark, c.Path, side, c.Line, summary)
 		style := lipgloss.NewStyle().Width(innerW).MaxWidth(innerW)
 		if i == cursor {
 			style = style.Foreground(lipgloss.Color("39")).Bold(true)
-		} else if staleMark == "!" {
+		} else if stale {
 			style = style.Foreground(lipgloss.Color("214"))
 		}
 		bodyLines = append(bodyLines, style.Render(line))
 	}
 	return paneStyle.Render(strings.Join(bodyLines, "\n"))
+}
+
+func fileStatusSymbol(status string) string {
+	switch {
+	case strings.Contains(status, "?"):
+		return "◌"
+	case strings.Contains(status, "A"):
+		return "✚"
+	case strings.Contains(status, "M"):
+		return "✱"
+	case strings.Contains(status, "D"):
+		return "✖"
+	case strings.Contains(status, "R"):
+		return "➜"
+	case strings.Contains(status, "U"):
+		return "⚠"
+	default:
+		return "•"
+	}
 }
 
 type fileTreeEntry struct {
