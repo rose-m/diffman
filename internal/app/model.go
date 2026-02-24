@@ -1492,20 +1492,27 @@ func (m Model) renderCommentDock() string {
 	}
 
 	contentW := max(10, m.width-2)
-	inputWidth := max(1, contentW-9)
+	bodyInnerW := max(1, contentW-4)
+	inputWidth := max(1, bodyInnerW-4)
 	input := m.commentInputModel
 	input.Width = inputWidth
 	inputBox := lipgloss.NewStyle().
+		Width(bodyInnerW).
+		MaxWidth(bodyInnerW).
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(lipgloss.Color("63")).
 		Padding(0, 1).
 		Render(input.View())
-	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Enter save | Esc cancel | Backspace delete")
+	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(
+		ansi.Truncate("Enter save | Esc cancel | Backspace delete", bodyInnerW, ""),
+	)
 
 	bodyLines := []string{inputBox, "", hint}
 	if m.commentInputErr != "" {
 		bodyLines = append(bodyLines, "")
-		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("Error: "+m.commentInputErr))
+		bodyLines = append(bodyLines, lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render(
+			ansi.Truncate("Error: "+m.commentInputErr, bodyInnerW, ""),
+		))
 	}
 
 	body := strings.Join(bodyLines, "\n")
@@ -1567,6 +1574,7 @@ func (m Model) renderDockPanel(title string, titleColor, borderColor lipgloss.Co
 
 	bodyBlock := lipgloss.NewStyle().
 		Width(contentW).
+		MaxWidth(contentW).
 		Padding(1, 2).
 		Render(body)
 
@@ -1652,7 +1660,7 @@ func (m Model) renderFilesPane(width, height int) string {
 				if entry.HasComment {
 					commentMark = commentMarkStyle.Render("✎ ")
 				}
-				line = fmt.Sprintf("%s%s%s%s %s", prefix, indent, commentMark, fileStatusSymbol(entry.Status), entry.Name)
+				line = fmt.Sprintf("%s%s%s%s %s", prefix, indent, commentMark, fileStatusSymbolStyled(entry.Status), entry.Name)
 			}
 			line = ansi.Truncate(line, innerW, "")
 			lineStyle := lipgloss.NewStyle().Width(innerW).MaxWidth(innerW)
@@ -1767,6 +1775,32 @@ func fileStatusSymbol(status string) string {
 		return "⚠"
 	default:
 		return "•"
+	}
+}
+
+func fileStatusSymbolStyled(status string) string {
+	return lipgloss.NewStyle().
+		Foreground(fileStatusColor(status)).
+		Bold(true).
+		Render(fileStatusSymbol(status))
+}
+
+func fileStatusColor(status string) lipgloss.Color {
+	switch {
+	case strings.Contains(status, "?"):
+		return lipgloss.Color("244")
+	case strings.Contains(status, "A"):
+		return lipgloss.Color("78")
+	case strings.Contains(status, "M"):
+		return lipgloss.Color("214")
+	case strings.Contains(status, "D"):
+		return lipgloss.Color("203")
+	case strings.Contains(status, "R"):
+		return lipgloss.Color("111")
+	case strings.Contains(status, "U"):
+		return lipgloss.Color("220")
+	default:
+		return lipgloss.Color("252")
 	}
 }
 
