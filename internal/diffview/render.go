@@ -2,9 +2,13 @@ package diffview
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
+	"sync"
 	"unicode"
 
+	"github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -32,6 +36,27 @@ type token struct {
 	end     int
 }
 
+type syntaxClass int
+
+const (
+	syntaxClassNone syntaxClass = -1
+
+	syntaxClassKeyword syntaxClass = iota
+	syntaxClassString
+	syntaxClassComment
+	syntaxClassType
+	syntaxClassFunction
+	syntaxClassNumber
+	syntaxClassOperator
+	syntaxClassPreprocessor
+)
+
+type syntaxRange struct {
+	start int
+	end   int
+	class syntaxClass
+}
+
 var (
 	addBaseStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
 	deleteBaseStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
@@ -49,6 +74,9 @@ var (
 	cursorCommentGutterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("201")).Bold(true)
 
 	commentInlineTextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
+
+	syntaxLexerCacheMu sync.RWMutex
+	syntaxLexerCache   = make(map[string]chroma.Lexer)
 )
 
 func RenderSplit(
@@ -226,15 +254,16 @@ func renderRowSegments(
 		baseStyle = baseStyle.Background(cursorRowBg)
 	}
 	changed := highlightRanges(row, side)
+	syntax := syntaxRangesForPath(row.Path, plainText)
 
 	out := make([]string, 0, len(chunks))
-	firstStyled := styleChunk(chunks[0].text, chunks[0].start, changed, baseStyle, highlightStyle)
+	firstStyled := styleChunk(chunks[0].text, chunks[0].start, changed, syntax, baseStyle, highlightStyle)
 	metaStyled := styleMeta(meta, row.Kind, side, isCursor)
 	out = append(out, prefix+metaStyled+firstStyled+strings.Repeat(" ", textWidth-len([]rune(chunks[0].text))))
 
 	contMeta := strings.Repeat(" ", metaWidth)
 	for _, chunk := range chunks[1:] {
-		styled := styleChunk(chunk.text, chunk.start, changed, baseStyle, highlightStyle)
+		styled := styleChunk(chunk.text, chunk.start, changed, syntax, baseStyle, highlightStyle)
 		out = append(out, contPrefix+contMeta+styled+strings.Repeat(" ", textWidth-len([]rune(chunk.text))))
 	}
 
@@ -302,33 +331,175 @@ func highlightRanges(row DiffRow, side Side) []textRange {
 	return newRanges
 }
 
-func styleChunk(text string, chunkStart int, ranges []textRange, baseStyle, highlightStyle lipgloss.Style) string {
+func styleChunk(text string, chunkStart int, ranges []textRange, syntax []syntaxRange, baseStyle, highlightStyle lipgloss.Style) string {
 	if text == "" {
 		return ""
 	}
-	if len(ranges) == 0 {
+	if len(ranges) == 0 && len(syntax) == 0 {
 		return baseStyle.Render(text)
 	}
 
 	runes := []rune(text)
 	var b strings.Builder
+	rangeIdx := 0
+	syntaxIdx := 0
 	start := 0
-	inHighlight := inRanges(chunkStart, ranges)
+	stateDiff, stateSyntax := styleStateAt(chunkStart, ranges, syntax, &rangeIdx, &syntaxIdx)
 	for i := 1; i <= len(runes); i++ {
-		if i == len(runes) || inRanges(chunkStart+i, ranges) != inHighlight {
+		nextDiff, nextSyntax := stateDiff, stateSyntax
+		if i < len(runes) {
+			nextDiff, nextSyntax = styleStateAt(chunkStart+i, ranges, syntax, &rangeIdx, &syntaxIdx)
+		}
+		if i == len(runes) || nextDiff != stateDiff || nextSyntax != stateSyntax {
 			seg := string(runes[start:i])
-			if inHighlight {
+			switch {
+			case stateDiff:
 				b.WriteString(highlightStyle.Render(seg))
-			} else {
+			case stateSyntax != syntaxClassNone:
+				b.WriteString(applySyntaxClass(baseStyle, stateSyntax).Render(seg))
+			default:
 				b.WriteString(baseStyle.Render(seg))
 			}
 			start = i
-			if i < len(runes) {
-				inHighlight = !inHighlight
-			}
+			stateDiff = nextDiff
+			stateSyntax = nextSyntax
 		}
 	}
 	return b.String()
+}
+
+func styleStateAt(pos int, ranges []textRange, syntax []syntaxRange, rangeIdx, syntaxIdx *int) (bool, syntaxClass) {
+	for *rangeIdx < len(ranges) && pos >= ranges[*rangeIdx].end {
+		*rangeIdx = *rangeIdx + 1
+	}
+	for *syntaxIdx < len(syntax) && pos >= syntax[*syntaxIdx].end {
+		*syntaxIdx = *syntaxIdx + 1
+	}
+
+	inDiff := *rangeIdx < len(ranges) && pos >= ranges[*rangeIdx].start
+	if *syntaxIdx < len(syntax) && pos >= syntax[*syntaxIdx].start {
+		return inDiff, syntax[*syntaxIdx].class
+	}
+	return inDiff, syntaxClassNone
+}
+
+func applySyntaxClass(base lipgloss.Style, class syntaxClass) lipgloss.Style {
+	switch class {
+	case syntaxClassKeyword:
+		return base.Foreground(lipgloss.Color("141"))
+	case syntaxClassString:
+		return base.Foreground(lipgloss.Color("186"))
+	case syntaxClassComment:
+		return base.Foreground(lipgloss.Color("244")).Italic(true)
+	case syntaxClassType:
+		return base.Foreground(lipgloss.Color("117"))
+	case syntaxClassFunction:
+		return base.Foreground(lipgloss.Color("221"))
+	case syntaxClassNumber:
+		return base.Foreground(lipgloss.Color("215"))
+	case syntaxClassOperator:
+		return base.Foreground(lipgloss.Color("204"))
+	case syntaxClassPreprocessor:
+		return base.Foreground(lipgloss.Color("178"))
+	default:
+		return base
+	}
+}
+
+func syntaxRangesForPath(path, text string) []syntaxRange {
+	if text == "" {
+		return nil
+	}
+	lexer := syntaxLexerForPath(path)
+	if lexer == nil {
+		return nil
+	}
+	it, err := lexer.Tokenise(nil, text)
+	if err != nil {
+		return nil
+	}
+
+	ranges := make([]syntaxRange, 0, 16)
+	pos := 0
+	for tok := it(); tok != chroma.EOF; tok = it() {
+		length := len([]rune(tok.Value))
+		if length == 0 {
+			continue
+		}
+		if class, ok := syntaxClassForToken(tok.Type); ok {
+			ranges = append(ranges, syntaxRange{start: pos, end: pos + length, class: class})
+		}
+		pos += length
+	}
+	return mergeSyntaxRanges(ranges)
+}
+
+func syntaxLexerForPath(path string) chroma.Lexer {
+	name := strings.ToLower(filepath.Ext(path))
+	if name == "" {
+		return nil
+	}
+
+	syntaxLexerCacheMu.RLock()
+	if lx, ok := syntaxLexerCache[name]; ok {
+		syntaxLexerCacheMu.RUnlock()
+		return lx
+	}
+	syntaxLexerCacheMu.RUnlock()
+
+	lx := lexers.Match("x" + name)
+	if lx == nil {
+		return nil
+	}
+	lx = chroma.Coalesce(lx)
+
+	syntaxLexerCacheMu.Lock()
+	syntaxLexerCache[name] = lx
+	syntaxLexerCacheMu.Unlock()
+	return lx
+}
+
+func syntaxClassForToken(ttype chroma.TokenType) (syntaxClass, bool) {
+	switch {
+	case ttype.InCategory(chroma.Comment):
+		return syntaxClassComment, true
+	case ttype.InCategory(chroma.LiteralString):
+		return syntaxClassString, true
+	case ttype.InCategory(chroma.Keyword):
+		return syntaxClassKeyword, true
+	case ttype.InCategory(chroma.NameClass), ttype.InCategory(chroma.NameBuiltinPseudo):
+		return syntaxClassType, true
+	case ttype.InCategory(chroma.NameFunction), ttype.InCategory(chroma.NameFunctionMagic), ttype.InCategory(chroma.NameDecorator):
+		return syntaxClassFunction, true
+	case ttype.InCategory(chroma.LiteralNumber):
+		return syntaxClassNumber, true
+	case ttype.InCategory(chroma.Operator):
+		return syntaxClassOperator, true
+	case ttype == chroma.CommentPreproc || ttype == chroma.CommentPreprocFile || ttype == chroma.KeywordNamespace:
+		return syntaxClassPreprocessor, true
+	default:
+		return 0, false
+	}
+}
+
+func mergeSyntaxRanges(in []syntaxRange) []syntaxRange {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]syntaxRange, 0, len(in))
+	cur := in[0]
+	for _, r := range in[1:] {
+		if r.start <= cur.end && r.class == cur.class {
+			if r.end > cur.end {
+				cur.end = r.end
+			}
+			continue
+		}
+		out = append(out, cur)
+		cur = r
+	}
+	out = append(out, cur)
+	return out
 }
 
 func inRanges(pos int, ranges []textRange) bool {
