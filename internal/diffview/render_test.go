@@ -180,6 +180,40 @@ func TestRenderSplitWithLayoutHighlightsChangedWords(t *testing.T) {
 	}
 }
 
+func TestDiffAccentStyleSelection(t *testing.T) {
+	if _, ok := gutterStyleFor(RowAdd, SideNew); !ok {
+		t.Fatalf("expected add gutter style")
+	}
+	if _, ok := gutterStyleFor(RowDelete, SideOld); !ok {
+		t.Fatalf("expected delete gutter style")
+	}
+	if _, ok := gutterStyleFor(RowChange, SideOld); !ok {
+		t.Fatalf("expected old change gutter style")
+	}
+	if _, ok := gutterStyleFor(RowChange, SideNew); !ok {
+		t.Fatalf("expected new change gutter style")
+	}
+	if _, ok := gutterStyleFor(RowContext, SideOld); ok {
+		t.Fatalf("expected no context gutter style")
+	}
+
+	if _, ok := metaStyleFor(RowAdd, SideNew); !ok {
+		t.Fatalf("expected add meta style")
+	}
+	if _, ok := metaStyleFor(RowDelete, SideOld); !ok {
+		t.Fatalf("expected delete meta style")
+	}
+	if _, ok := metaStyleFor(RowChange, SideOld); !ok {
+		t.Fatalf("expected old change meta style")
+	}
+	if _, ok := metaStyleFor(RowChange, SideNew); !ok {
+		t.Fatalf("expected new change meta style")
+	}
+	if _, ok := metaStyleFor(RowContext, SideOld); ok {
+		t.Fatalf("expected no context meta style")
+	}
+}
+
 func TestSyntaxRangesForPathUsesChromaLexerByExtension(t *testing.T) {
 	rangesGo := syntaxRangesForPath("example.go", "if n > 10 { return \"x\" }")
 	if len(rangesGo) == 0 {

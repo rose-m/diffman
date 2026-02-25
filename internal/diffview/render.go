@@ -58,10 +58,10 @@ type syntaxRange struct {
 }
 
 var (
-	addBaseStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
-	deleteBaseStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	changeOldBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("210"))
-	changeNewBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("121"))
+	addBaseStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Background(lipgloss.Color("#1a2620"))
+	deleteBaseStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Background(lipgloss.Color("#2a1f21"))
+	changeOldBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("#252022"))
+	changeNewBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("#1f2523"))
 	contextBaseStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	hunkBaseStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
 
@@ -72,6 +72,14 @@ var (
 	cursorGutterStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("45")).Bold(true)
 	commentGutterStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("220")).Bold(true)
 	cursorCommentGutterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("201")).Bold(true)
+	addGutterStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("22")).Bold(true)
+	deleteGutterStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("52")).Bold(true)
+	changeOldGutterStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("53")).Bold(true)
+	changeNewGutterStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("23")).Bold(true)
+	addMetaStyle             = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("22")).Bold(true)
+	deleteMetaStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("52")).Bold(true)
+	changeOldMetaStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("53")).Bold(true)
+	changeNewMetaStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("23")).Bold(true)
 
 	commentInlineTextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 
@@ -195,8 +203,8 @@ func renderRowSegments(
 	hasComment func(path string, line int, side Side) bool,
 ) []string {
 	hasAnyComment := hasCommentOnAnySide(row, hasComment)
-	prefix := renderGutterPrefix(isCursor, hasAnyComment)
-	contPrefix := "   "
+	prefix := renderGutterPrefix(isCursor, hasAnyComment, row.Kind, side)
+	contPrefix := renderContinuationGutterPrefix(isCursor, hasAnyComment, row.Kind, side)
 	lineWidth := maxInt(1, width-lipgloss.Width(prefix))
 
 	switch row.Kind {
@@ -218,7 +226,7 @@ func renderRowSegments(
 				hstyle = hstyle.Background(cursorRowBg)
 			}
 			styled := hstyle.Render(chunk.text)
-			out = append(out, p+styled+strings.Repeat(" ", lineWidth-len([]rune(chunk.text))))
+			out = append(out, p+styled+styledPad(hstyle, lineWidth-len([]rune(chunk.text))))
 		}
 		if len(out) == 0 {
 			out = append(out, prefix+strings.Repeat(" ", lineWidth))
@@ -259,18 +267,18 @@ func renderRowSegments(
 	out := make([]string, 0, len(chunks))
 	firstStyled := styleChunk(chunks[0].text, chunks[0].start, changed, syntax, baseStyle, highlightStyle)
 	metaStyled := styleMeta(meta, row.Kind, side, isCursor)
-	out = append(out, prefix+metaStyled+firstStyled+strings.Repeat(" ", textWidth-len([]rune(chunks[0].text))))
+	out = append(out, prefix+metaStyled+firstStyled+styledPad(baseStyle, textWidth-len([]rune(chunks[0].text))))
 
-	contMeta := strings.Repeat(" ", metaWidth)
+	contMeta := styleMeta(strings.Repeat(" ", metaWidth), row.Kind, side, isCursor)
 	for _, chunk := range chunks[1:] {
 		styled := styleChunk(chunk.text, chunk.start, changed, syntax, baseStyle, highlightStyle)
-		out = append(out, contPrefix+contMeta+styled+strings.Repeat(" ", textWidth-len([]rune(chunk.text))))
+		out = append(out, contPrefix+contMeta+styled+styledPad(baseStyle, textWidth-len([]rune(chunk.text))))
 	}
 
 	return out
 }
 
-func renderGutterPrefix(isCursor, hasComment bool) string {
+func renderGutterPrefix(isCursor, hasComment bool, kind RowKind, side Side) string {
 	cursorMark := " "
 	if isCursor {
 		cursorMark = "▸"
@@ -283,23 +291,85 @@ func renderGutterPrefix(isCursor, hasComment bool) string {
 
 	switch {
 	case isCursor && hasComment:
-		return cursorCommentGutterStyle.Render(marks) + " "
+		return cursorCommentGutterStyle.Render(marks + " ")
 	case isCursor:
-		return cursorGutterStyle.Render(marks) + " "
+		return cursorGutterStyle.Render(marks + " ")
 	case hasComment:
-		return commentGutterStyle.Render(marks) + " "
+		return commentGutterStyle.Render(marks + " ")
 	default:
+		if style, ok := gutterStyleFor(kind, side); ok {
+			return style.Render(marks + " ")
+		}
 		return marks + " "
 	}
 }
 
-func styleMeta(meta string, kind RowKind, side Side, isCursor bool) string {
-	base, _ := stylesForContent(kind, side)
-	metaStyle := base.Bold(isCursor)
-	if isCursor {
-		metaStyle = metaStyle.Foreground(lipgloss.Color("230")).Background(cursorRowBg)
+func renderContinuationGutterPrefix(isCursor, hasComment bool, kind RowKind, side Side) string {
+	spaces := "   "
+	switch {
+	case isCursor && hasComment:
+		return cursorCommentGutterStyle.Render(spaces)
+	case isCursor:
+		return cursorGutterStyle.Render(spaces)
+	case hasComment:
+		return commentGutterStyle.Render(spaces)
+	default:
+		if style, ok := gutterStyleFor(kind, side); ok {
+			return style.Render(spaces)
+		}
+		return spaces
 	}
+}
+
+func styleMeta(meta string, kind RowKind, side Side, isCursor bool) string {
+	if isCursor {
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(cursorRowBg).Render(meta)
+	}
+	if style, ok := metaStyleFor(kind, side); ok {
+		return style.Render(meta)
+	}
+	base, _ := stylesForContent(kind, side)
+	metaStyle := base
 	return metaStyle.Render(meta)
+}
+
+func gutterStyleFor(kind RowKind, side Side) (lipgloss.Style, bool) {
+	switch kind {
+	case RowAdd:
+		return addGutterStyle, true
+	case RowDelete:
+		return deleteGutterStyle, true
+	case RowChange:
+		if side == SideOld {
+			return changeOldGutterStyle, true
+		}
+		return changeNewGutterStyle, true
+	default:
+		return lipgloss.Style{}, false
+	}
+}
+
+func metaStyleFor(kind RowKind, side Side) (lipgloss.Style, bool) {
+	switch kind {
+	case RowAdd:
+		return addMetaStyle, true
+	case RowDelete:
+		return deleteMetaStyle, true
+	case RowChange:
+		if side == SideOld {
+			return changeOldMetaStyle, true
+		}
+		return changeNewMetaStyle, true
+	default:
+		return lipgloss.Style{}, false
+	}
+}
+
+func styledPad(style lipgloss.Style, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return style.Render(strings.Repeat(" ", width))
 }
 
 func stylesForContent(kind RowKind, side Side) (lipgloss.Style, lipgloss.Style) {
