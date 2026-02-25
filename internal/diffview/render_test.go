@@ -180,6 +180,75 @@ func TestRenderSplitWithLayoutHighlightsChangedWords(t *testing.T) {
 	}
 }
 
+func TestDiffAccentStyleSelection(t *testing.T) {
+	if _, ok := gutterStyleFor(RowAdd, SideNew); !ok {
+		t.Fatalf("expected add gutter style")
+	}
+	if _, ok := gutterStyleFor(RowDelete, SideOld); !ok {
+		t.Fatalf("expected delete gutter style")
+	}
+	if _, ok := gutterStyleFor(RowChange, SideOld); !ok {
+		t.Fatalf("expected old change gutter style")
+	}
+	if _, ok := gutterStyleFor(RowChange, SideNew); !ok {
+		t.Fatalf("expected new change gutter style")
+	}
+	if _, ok := gutterStyleFor(RowContext, SideOld); ok {
+		t.Fatalf("expected no context gutter style")
+	}
+
+	if _, ok := metaStyleFor(RowAdd, SideNew); !ok {
+		t.Fatalf("expected add meta style")
+	}
+	if _, ok := metaStyleFor(RowDelete, SideOld); !ok {
+		t.Fatalf("expected delete meta style")
+	}
+	if _, ok := metaStyleFor(RowChange, SideOld); !ok {
+		t.Fatalf("expected old change meta style")
+	}
+	if _, ok := metaStyleFor(RowChange, SideNew); !ok {
+		t.Fatalf("expected new change meta style")
+	}
+	if _, ok := metaStyleFor(RowContext, SideOld); ok {
+		t.Fatalf("expected no context meta style")
+	}
+}
+
+func TestSyntaxRangesForPathUsesChromaLexerByExtension(t *testing.T) {
+	rangesGo := syntaxRangesForPath("example.go", "if n > 10 { return \"x\" }")
+	if len(rangesGo) == 0 {
+		t.Fatalf("expected syntax ranges for Go file")
+	}
+	rangesTxt := syntaxRangesForPath("example.txt", "if n > 10 { return \"x\" }")
+	if len(rangesTxt) != 0 {
+		t.Fatalf("expected no syntax ranges for text file, got %v", rangesTxt)
+	}
+}
+
+func TestSyntaxRangesForPathClassifiesKeywordAndString(t *testing.T) {
+	ranges := syntaxRangesForPath("example.go", "if n == 1 { return \"x\" }")
+	if len(ranges) == 0 {
+		t.Fatalf("expected syntax ranges for Go sample")
+	}
+
+	hasKeyword := false
+	hasString := false
+	for _, r := range ranges {
+		if r.class == syntaxClassKeyword {
+			hasKeyword = true
+		}
+		if r.class == syntaxClassString {
+			hasString = true
+		}
+	}
+	if !hasKeyword {
+		t.Fatalf("expected at least one keyword syntax range, got %v", ranges)
+	}
+	if !hasString {
+		t.Fatalf("expected at least one string syntax range, got %v", ranges)
+	}
+}
+
 func TestRenderSplitShowsCommentMarkerOnBothPanes(t *testing.T) {
 	rows := []DiffRow{
 		{Kind: RowChange, Path: "a.txt", OldLine: intPtr(4), NewLine: intPtr(4), OldText: "old", NewText: "new"},

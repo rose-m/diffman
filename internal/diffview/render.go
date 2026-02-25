@@ -2,9 +2,13 @@ package diffview
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
+	"sync"
 	"unicode"
 
+	"github.com/alecthomas/chroma/v2"
+	"github.com/alecthomas/chroma/v2/lexers"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -32,11 +36,32 @@ type token struct {
 	end     int
 }
 
+type syntaxClass int
+
+const (
+	syntaxClassNone syntaxClass = -1
+
+	syntaxClassKeyword syntaxClass = iota
+	syntaxClassString
+	syntaxClassComment
+	syntaxClassType
+	syntaxClassFunction
+	syntaxClassNumber
+	syntaxClassOperator
+	syntaxClassPreprocessor
+)
+
+type syntaxRange struct {
+	start int
+	end   int
+	class syntaxClass
+}
+
 var (
-	addBaseStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))
-	deleteBaseStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-	changeOldBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("210"))
-	changeNewBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("121"))
+	addBaseStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Background(lipgloss.Color("#1a2620"))
+	deleteBaseStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Background(lipgloss.Color("#2a1f21"))
+	changeOldBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("#252022"))
+	changeNewBaseStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("#1f2523"))
 	contextBaseStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	hunkBaseStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Bold(true)
 
@@ -47,8 +72,19 @@ var (
 	cursorGutterStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("45")).Bold(true)
 	commentGutterStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("220")).Bold(true)
 	cursorCommentGutterStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("16")).Background(lipgloss.Color("201")).Bold(true)
+	addGutterStyle           = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("22")).Bold(true)
+	deleteGutterStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("52")).Bold(true)
+	changeOldGutterStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("53")).Bold(true)
+	changeNewGutterStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("23")).Bold(true)
+	addMetaStyle             = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("22")).Bold(true)
+	deleteMetaStyle          = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("52")).Bold(true)
+	changeOldMetaStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("210")).Background(lipgloss.Color("53")).Bold(true)
+	changeNewMetaStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("121")).Background(lipgloss.Color("23")).Bold(true)
 
 	commentInlineTextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
+
+	syntaxLexerCacheMu sync.RWMutex
+	syntaxLexerCache   = make(map[string]chroma.Lexer)
 )
 
 func RenderSplit(
@@ -167,8 +203,8 @@ func renderRowSegments(
 	hasComment func(path string, line int, side Side) bool,
 ) []string {
 	hasAnyComment := hasCommentOnAnySide(row, hasComment)
-	prefix := renderGutterPrefix(isCursor, hasAnyComment)
-	contPrefix := "   "
+	prefix := renderGutterPrefix(isCursor, hasAnyComment, row.Kind, side)
+	contPrefix := renderContinuationGutterPrefix(isCursor, hasAnyComment, row.Kind, side)
 	lineWidth := maxInt(1, width-lipgloss.Width(prefix))
 
 	switch row.Kind {
@@ -190,7 +226,7 @@ func renderRowSegments(
 				hstyle = hstyle.Background(cursorRowBg)
 			}
 			styled := hstyle.Render(chunk.text)
-			out = append(out, p+styled+strings.Repeat(" ", lineWidth-len([]rune(chunk.text))))
+			out = append(out, p+styled+styledPad(hstyle, lineWidth-len([]rune(chunk.text))))
 		}
 		if len(out) == 0 {
 			out = append(out, prefix+strings.Repeat(" ", lineWidth))
@@ -226,22 +262,23 @@ func renderRowSegments(
 		baseStyle = baseStyle.Background(cursorRowBg)
 	}
 	changed := highlightRanges(row, side)
+	syntax := syntaxRangesForPath(row.Path, plainText)
 
 	out := make([]string, 0, len(chunks))
-	firstStyled := styleChunk(chunks[0].text, chunks[0].start, changed, baseStyle, highlightStyle)
+	firstStyled := styleChunk(chunks[0].text, chunks[0].start, changed, syntax, baseStyle, highlightStyle)
 	metaStyled := styleMeta(meta, row.Kind, side, isCursor)
-	out = append(out, prefix+metaStyled+firstStyled+strings.Repeat(" ", textWidth-len([]rune(chunks[0].text))))
+	out = append(out, prefix+metaStyled+firstStyled+styledPad(baseStyle, textWidth-len([]rune(chunks[0].text))))
 
-	contMeta := strings.Repeat(" ", metaWidth)
+	contMeta := styleMeta(strings.Repeat(" ", metaWidth), row.Kind, side, isCursor)
 	for _, chunk := range chunks[1:] {
-		styled := styleChunk(chunk.text, chunk.start, changed, baseStyle, highlightStyle)
-		out = append(out, contPrefix+contMeta+styled+strings.Repeat(" ", textWidth-len([]rune(chunk.text))))
+		styled := styleChunk(chunk.text, chunk.start, changed, syntax, baseStyle, highlightStyle)
+		out = append(out, contPrefix+contMeta+styled+styledPad(baseStyle, textWidth-len([]rune(chunk.text))))
 	}
 
 	return out
 }
 
-func renderGutterPrefix(isCursor, hasComment bool) string {
+func renderGutterPrefix(isCursor, hasComment bool, kind RowKind, side Side) string {
 	cursorMark := " "
 	if isCursor {
 		cursorMark = "▸"
@@ -254,23 +291,85 @@ func renderGutterPrefix(isCursor, hasComment bool) string {
 
 	switch {
 	case isCursor && hasComment:
-		return cursorCommentGutterStyle.Render(marks) + " "
+		return cursorCommentGutterStyle.Render(marks + " ")
 	case isCursor:
-		return cursorGutterStyle.Render(marks) + " "
+		return cursorGutterStyle.Render(marks + " ")
 	case hasComment:
-		return commentGutterStyle.Render(marks) + " "
+		return commentGutterStyle.Render(marks + " ")
 	default:
+		if style, ok := gutterStyleFor(kind, side); ok {
+			return style.Render(marks + " ")
+		}
 		return marks + " "
 	}
 }
 
-func styleMeta(meta string, kind RowKind, side Side, isCursor bool) string {
-	base, _ := stylesForContent(kind, side)
-	metaStyle := base.Bold(isCursor)
-	if isCursor {
-		metaStyle = metaStyle.Foreground(lipgloss.Color("230")).Background(cursorRowBg)
+func renderContinuationGutterPrefix(isCursor, hasComment bool, kind RowKind, side Side) string {
+	spaces := "   "
+	switch {
+	case isCursor && hasComment:
+		return cursorCommentGutterStyle.Render(spaces)
+	case isCursor:
+		return cursorGutterStyle.Render(spaces)
+	case hasComment:
+		return commentGutterStyle.Render(spaces)
+	default:
+		if style, ok := gutterStyleFor(kind, side); ok {
+			return style.Render(spaces)
+		}
+		return spaces
 	}
+}
+
+func styleMeta(meta string, kind RowKind, side Side, isCursor bool) string {
+	if isCursor {
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("230")).Background(cursorRowBg).Render(meta)
+	}
+	if style, ok := metaStyleFor(kind, side); ok {
+		return style.Render(meta)
+	}
+	base, _ := stylesForContent(kind, side)
+	metaStyle := base
 	return metaStyle.Render(meta)
+}
+
+func gutterStyleFor(kind RowKind, side Side) (lipgloss.Style, bool) {
+	switch kind {
+	case RowAdd:
+		return addGutterStyle, true
+	case RowDelete:
+		return deleteGutterStyle, true
+	case RowChange:
+		if side == SideOld {
+			return changeOldGutterStyle, true
+		}
+		return changeNewGutterStyle, true
+	default:
+		return lipgloss.Style{}, false
+	}
+}
+
+func metaStyleFor(kind RowKind, side Side) (lipgloss.Style, bool) {
+	switch kind {
+	case RowAdd:
+		return addMetaStyle, true
+	case RowDelete:
+		return deleteMetaStyle, true
+	case RowChange:
+		if side == SideOld {
+			return changeOldMetaStyle, true
+		}
+		return changeNewMetaStyle, true
+	default:
+		return lipgloss.Style{}, false
+	}
+}
+
+func styledPad(style lipgloss.Style, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return style.Render(strings.Repeat(" ", width))
 }
 
 func stylesForContent(kind RowKind, side Side) (lipgloss.Style, lipgloss.Style) {
@@ -302,33 +401,175 @@ func highlightRanges(row DiffRow, side Side) []textRange {
 	return newRanges
 }
 
-func styleChunk(text string, chunkStart int, ranges []textRange, baseStyle, highlightStyle lipgloss.Style) string {
+func styleChunk(text string, chunkStart int, ranges []textRange, syntax []syntaxRange, baseStyle, highlightStyle lipgloss.Style) string {
 	if text == "" {
 		return ""
 	}
-	if len(ranges) == 0 {
+	if len(ranges) == 0 && len(syntax) == 0 {
 		return baseStyle.Render(text)
 	}
 
 	runes := []rune(text)
 	var b strings.Builder
+	rangeIdx := 0
+	syntaxIdx := 0
 	start := 0
-	inHighlight := inRanges(chunkStart, ranges)
+	stateDiff, stateSyntax := styleStateAt(chunkStart, ranges, syntax, &rangeIdx, &syntaxIdx)
 	for i := 1; i <= len(runes); i++ {
-		if i == len(runes) || inRanges(chunkStart+i, ranges) != inHighlight {
+		nextDiff, nextSyntax := stateDiff, stateSyntax
+		if i < len(runes) {
+			nextDiff, nextSyntax = styleStateAt(chunkStart+i, ranges, syntax, &rangeIdx, &syntaxIdx)
+		}
+		if i == len(runes) || nextDiff != stateDiff || nextSyntax != stateSyntax {
 			seg := string(runes[start:i])
-			if inHighlight {
+			switch {
+			case stateDiff:
 				b.WriteString(highlightStyle.Render(seg))
-			} else {
+			case stateSyntax != syntaxClassNone:
+				b.WriteString(applySyntaxClass(baseStyle, stateSyntax).Render(seg))
+			default:
 				b.WriteString(baseStyle.Render(seg))
 			}
 			start = i
-			if i < len(runes) {
-				inHighlight = !inHighlight
-			}
+			stateDiff = nextDiff
+			stateSyntax = nextSyntax
 		}
 	}
 	return b.String()
+}
+
+func styleStateAt(pos int, ranges []textRange, syntax []syntaxRange, rangeIdx, syntaxIdx *int) (bool, syntaxClass) {
+	for *rangeIdx < len(ranges) && pos >= ranges[*rangeIdx].end {
+		*rangeIdx = *rangeIdx + 1
+	}
+	for *syntaxIdx < len(syntax) && pos >= syntax[*syntaxIdx].end {
+		*syntaxIdx = *syntaxIdx + 1
+	}
+
+	inDiff := *rangeIdx < len(ranges) && pos >= ranges[*rangeIdx].start
+	if *syntaxIdx < len(syntax) && pos >= syntax[*syntaxIdx].start {
+		return inDiff, syntax[*syntaxIdx].class
+	}
+	return inDiff, syntaxClassNone
+}
+
+func applySyntaxClass(base lipgloss.Style, class syntaxClass) lipgloss.Style {
+	switch class {
+	case syntaxClassKeyword:
+		return base.Foreground(lipgloss.Color("141"))
+	case syntaxClassString:
+		return base.Foreground(lipgloss.Color("186"))
+	case syntaxClassComment:
+		return base.Foreground(lipgloss.Color("244")).Italic(true)
+	case syntaxClassType:
+		return base.Foreground(lipgloss.Color("117"))
+	case syntaxClassFunction:
+		return base.Foreground(lipgloss.Color("221"))
+	case syntaxClassNumber:
+		return base.Foreground(lipgloss.Color("215"))
+	case syntaxClassOperator:
+		return base.Foreground(lipgloss.Color("204"))
+	case syntaxClassPreprocessor:
+		return base.Foreground(lipgloss.Color("178"))
+	default:
+		return base
+	}
+}
+
+func syntaxRangesForPath(path, text string) []syntaxRange {
+	if text == "" {
+		return nil
+	}
+	lexer := syntaxLexerForPath(path)
+	if lexer == nil {
+		return nil
+	}
+	it, err := lexer.Tokenise(nil, text)
+	if err != nil {
+		return nil
+	}
+
+	ranges := make([]syntaxRange, 0, 16)
+	pos := 0
+	for tok := it(); tok != chroma.EOF; tok = it() {
+		length := len([]rune(tok.Value))
+		if length == 0 {
+			continue
+		}
+		if class, ok := syntaxClassForToken(tok.Type); ok {
+			ranges = append(ranges, syntaxRange{start: pos, end: pos + length, class: class})
+		}
+		pos += length
+	}
+	return mergeSyntaxRanges(ranges)
+}
+
+func syntaxLexerForPath(path string) chroma.Lexer {
+	name := strings.ToLower(filepath.Ext(path))
+	if name == "" {
+		return nil
+	}
+
+	syntaxLexerCacheMu.RLock()
+	if lx, ok := syntaxLexerCache[name]; ok {
+		syntaxLexerCacheMu.RUnlock()
+		return lx
+	}
+	syntaxLexerCacheMu.RUnlock()
+
+	lx := lexers.Match("x" + name)
+	if lx == nil {
+		return nil
+	}
+	lx = chroma.Coalesce(lx)
+
+	syntaxLexerCacheMu.Lock()
+	syntaxLexerCache[name] = lx
+	syntaxLexerCacheMu.Unlock()
+	return lx
+}
+
+func syntaxClassForToken(ttype chroma.TokenType) (syntaxClass, bool) {
+	switch {
+	case ttype.InCategory(chroma.Comment):
+		return syntaxClassComment, true
+	case ttype.InCategory(chroma.LiteralString):
+		return syntaxClassString, true
+	case ttype.InCategory(chroma.Keyword):
+		return syntaxClassKeyword, true
+	case ttype.InCategory(chroma.NameClass), ttype.InCategory(chroma.NameBuiltinPseudo):
+		return syntaxClassType, true
+	case ttype.InCategory(chroma.NameFunction), ttype.InCategory(chroma.NameFunctionMagic), ttype.InCategory(chroma.NameDecorator):
+		return syntaxClassFunction, true
+	case ttype.InCategory(chroma.LiteralNumber):
+		return syntaxClassNumber, true
+	case ttype.InCategory(chroma.Operator):
+		return syntaxClassOperator, true
+	case ttype == chroma.CommentPreproc || ttype == chroma.CommentPreprocFile || ttype == chroma.KeywordNamespace:
+		return syntaxClassPreprocessor, true
+	default:
+		return 0, false
+	}
+}
+
+func mergeSyntaxRanges(in []syntaxRange) []syntaxRange {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]syntaxRange, 0, len(in))
+	cur := in[0]
+	for _, r := range in[1:] {
+		if r.start <= cur.end && r.class == cur.class {
+			if r.end > cur.end {
+				cur.end = r.end
+			}
+			continue
+		}
+		out = append(out, cur)
+		cur = r
+	}
+	out = append(out, cur)
+	return out
 }
 
 func inRanges(pos int, ranges []textRange) bool {
