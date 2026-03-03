@@ -15,6 +15,7 @@ const (
 
 type AppConfig struct {
 	LeaderCommands map[string]string `json:"leader_commands"`
+	Theme          string            `json:"theme,omitempty"`
 }
 
 func Load() (AppConfig, string, error) {
@@ -29,6 +30,7 @@ func Load() (AppConfig, string, error) {
 func LoadFromPath(path string) (AppConfig, error) {
 	cfg := AppConfig{
 		LeaderCommands: make(map[string]string),
+		Theme:          "auto",
 	}
 
 	data, err := os.ReadFile(path)
@@ -51,6 +53,12 @@ func LoadFromPath(path string) (AppConfig, error) {
 		cfg.LeaderCommands = make(map[string]string)
 	}
 
+	theme, err := normalizeTheme(cfg.Theme)
+	if err != nil {
+		return AppConfig{}, err
+	}
+	cfg.Theme = theme
+
 	normalized := make(map[string]string, len(cfg.LeaderCommands))
 	for k, v := range cfg.LeaderCommands {
 		key := strings.TrimSpace(k)
@@ -69,6 +77,19 @@ func LoadFromPath(path string) (AppConfig, error) {
 	cfg.LeaderCommands = normalized
 
 	return cfg, nil
+}
+
+func normalizeTheme(raw string) (string, error) {
+	theme := strings.ToLower(strings.TrimSpace(raw))
+	if theme == "" {
+		return "auto", nil
+	}
+	switch theme {
+	case "auto", "light", "dark":
+		return theme, nil
+	default:
+		return "", fmt.Errorf("theme %q must be one of auto, light, dark", raw)
+	}
 }
 
 func DefaultPath() (string, error) {

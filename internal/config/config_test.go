@@ -15,6 +15,9 @@ func TestLoadFromPathMissingFile(t *testing.T) {
 	if len(cfg.LeaderCommands) != 0 {
 		t.Fatalf("expected empty commands, got %d", len(cfg.LeaderCommands))
 	}
+	if cfg.Theme != "auto" {
+		t.Fatalf("expected default theme auto, got %q", cfg.Theme)
+	}
 }
 
 func TestLoadFromPathParsesLeaderCommands(t *testing.T) {
@@ -36,6 +39,22 @@ func TestLoadFromPathParsesLeaderCommands(t *testing.T) {
 	}
 }
 
+func TestLoadFromPathParsesTheme(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"theme":"LiGhT"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	cfg, err := LoadFromPath(path)
+	if err != nil {
+		t.Fatalf("LoadFromPath() error = %v", err)
+	}
+	if cfg.Theme != "light" {
+		t.Fatalf("expected light theme, got %q", cfg.Theme)
+	}
+}
+
 func TestLoadFromPathRejectsInvalidKey(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
@@ -45,6 +64,18 @@ func TestLoadFromPathRejectsInvalidKey(t *testing.T) {
 
 	if _, err := LoadFromPath(path); err == nil {
 		t.Fatalf("expected error for invalid key")
+	}
+}
+
+func TestLoadFromPathRejectsInvalidTheme(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"theme":"sepia"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	if _, err := LoadFromPath(path); err == nil {
+		t.Fatalf("expected error for invalid theme")
 	}
 }
 

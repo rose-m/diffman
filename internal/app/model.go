@@ -156,6 +156,7 @@ func NewModel() (Model, error) {
 	store := comments.NewStore(gitDir)
 	loadedComments, loadErr := store.Load()
 	appConfig, configPath, configErr := config.Load()
+	diffview.InitializeTheme(appConfig.Theme)
 	if appConfig.LeaderCommands == nil {
 		appConfig.LeaderCommands = make(map[string]string)
 	}
