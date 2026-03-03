@@ -388,6 +388,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key.Matches(msg, m.keys.Refresh) {
+			diffview.ClearSyntaxCache()
 			m.loadingFiles = true
 			return m, m.loadFilesCmd()
 		}

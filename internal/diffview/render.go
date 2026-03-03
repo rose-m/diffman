@@ -57,6 +57,11 @@ type syntaxRange struct {
 	class syntaxClass
 }
 
+type syntaxCacheKey struct {
+	ext  string
+	text string
+}
+
 var (
 	addBaseStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Background(lipgloss.Color("#1a2620"))
 	deleteBaseStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Background(lipgloss.Color("#2a1f21"))
@@ -94,7 +99,16 @@ var (
 
 	syntaxLexerCacheMu sync.RWMutex
 	syntaxLexerCache   = make(map[string]chroma.Lexer)
+
+	syntaxRangesCacheMu sync.RWMutex
+	syntaxRangesCache   = make(map[syntaxCacheKey][]syntaxRange)
 )
+
+func ClearSyntaxCache() {
+	syntaxRangesCacheMu.Lock()
+	syntaxRangesCache = make(map[syntaxCacheKey][]syntaxRange)
+	syntaxRangesCacheMu.Unlock()
+}
 
 func RenderSplit(
 	rows []DiffRow,
@@ -489,6 +503,19 @@ func syntaxRangesForPath(path, text string) []syntaxRange {
 	if text == "" {
 		return nil
 	}
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext == "" {
+		return nil
+	}
+	key := syntaxCacheKey{ext: ext, text: text}
+
+	syntaxRangesCacheMu.RLock()
+	if ranges, ok := syntaxRangesCache[key]; ok {
+		syntaxRangesCacheMu.RUnlock()
+		return ranges
+	}
+	syntaxRangesCacheMu.RUnlock()
+
 	lexer := syntaxLexerForPath(path)
 	if lexer == nil {
 		return nil
@@ -510,7 +537,13 @@ func syntaxRangesForPath(path, text string) []syntaxRange {
 		}
 		pos += length
 	}
-	return mergeSyntaxRanges(ranges)
+	merged := mergeSyntaxRanges(ranges)
+
+	syntaxRangesCacheMu.Lock()
+	syntaxRangesCache[key] = merged
+	syntaxRangesCacheMu.Unlock()
+
+	return merged
 }
 
 func syntaxLexerForPath(path string) chroma.Lexer {

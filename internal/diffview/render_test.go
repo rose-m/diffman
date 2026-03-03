@@ -249,6 +249,42 @@ func TestSyntaxRangesForPathClassifiesKeywordAndString(t *testing.T) {
 	}
 }
 
+func TestSyntaxRangesForPathCachesByExtensionAndText(t *testing.T) {
+	ClearSyntaxCache()
+
+	text := "if n == 1 { return \"x\" }"
+	first := syntaxRangesForPath("example.go", text)
+	second := syntaxRangesForPath("other.go", text)
+	if len(first) == 0 || len(second) == 0 {
+		t.Fatalf("expected syntax ranges for Go sample")
+	}
+
+	syntaxRangesCacheMu.RLock()
+	defer syntaxRangesCacheMu.RUnlock()
+	if len(syntaxRangesCache) != 1 {
+		t.Fatalf("expected one cached entry, got %d", len(syntaxRangesCache))
+	}
+}
+
+func TestClearSyntaxCacheResetsEntries(t *testing.T) {
+	_ = syntaxRangesForPath("example.go", "if n == 1 { return \"x\" }")
+
+	syntaxRangesCacheMu.RLock()
+	before := len(syntaxRangesCache)
+	syntaxRangesCacheMu.RUnlock()
+	if before == 0 {
+		t.Fatalf("expected cache to have entries before clear")
+	}
+
+	ClearSyntaxCache()
+
+	syntaxRangesCacheMu.RLock()
+	defer syntaxRangesCacheMu.RUnlock()
+	if len(syntaxRangesCache) != 0 {
+		t.Fatalf("expected empty cache after clear, got %d", len(syntaxRangesCache))
+	}
+}
+
 func TestRenderSplitShowsCommentMarkerOnBothPanes(t *testing.T) {
 	rows := []DiffRow{
 		{Kind: RowChange, Path: "a.txt", OldLine: intPtr(4), NewLine: intPtr(4), OldText: "old", NewText: "new"},
