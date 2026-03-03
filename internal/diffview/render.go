@@ -83,6 +83,15 @@ var (
 
 	commentInlineTextStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("250")).Background(lipgloss.Color("236"))
 
+	syntaxKeywordColor      = lipgloss.Color("141")
+	syntaxStringColor       = lipgloss.Color("186")
+	syntaxCommentColor      = lipgloss.Color("244")
+	syntaxTypeColor         = lipgloss.Color("117")
+	syntaxFunctionColor     = lipgloss.Color("221")
+	syntaxNumberColor       = lipgloss.Color("215")
+	syntaxOperatorColor     = lipgloss.Color("204")
+	syntaxPreprocessorColor = lipgloss.Color("178")
+
 	syntaxLexerCacheMu sync.RWMutex
 	syntaxLexerCache   = make(map[string]chroma.Lexer)
 )
@@ -456,21 +465,21 @@ func styleStateAt(pos int, ranges []textRange, syntax []syntaxRange, rangeIdx, s
 func applySyntaxClass(base lipgloss.Style, class syntaxClass) lipgloss.Style {
 	switch class {
 	case syntaxClassKeyword:
-		return base.Foreground(lipgloss.Color("141"))
+		return base.Foreground(syntaxKeywordColor)
 	case syntaxClassString:
-		return base.Foreground(lipgloss.Color("186"))
+		return base.Foreground(syntaxStringColor)
 	case syntaxClassComment:
-		return base.Foreground(lipgloss.Color("244")).Italic(true)
+		return base.Foreground(syntaxCommentColor).Italic(true)
 	case syntaxClassType:
-		return base.Foreground(lipgloss.Color("117"))
+		return base.Foreground(syntaxTypeColor)
 	case syntaxClassFunction:
-		return base.Foreground(lipgloss.Color("221"))
+		return base.Foreground(syntaxFunctionColor)
 	case syntaxClassNumber:
-		return base.Foreground(lipgloss.Color("215"))
+		return base.Foreground(syntaxNumberColor)
 	case syntaxClassOperator:
-		return base.Foreground(lipgloss.Color("204"))
+		return base.Foreground(syntaxOperatorColor)
 	case syntaxClassPreprocessor:
-		return base.Foreground(lipgloss.Color("178"))
+		return base.Foreground(syntaxPreprocessorColor)
 	default:
 		return base
 	}
