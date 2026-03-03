@@ -266,6 +266,42 @@ func TestSyntaxRangesForPathCachesByExtensionAndText(t *testing.T) {
 	}
 }
 
+func TestSyntaxRangesForPathSkipsJ2Templates(t *testing.T) {
+	ClearSyntaxCache()
+
+	ranges := syntaxRangesForPath("pipeline.py.j2", "{% for t in tables %}{{ t }}{% endfor %}")
+	if len(ranges) != 0 {
+		t.Fatalf("expected no syntax ranges for .j2 template, got %v", ranges)
+	}
+
+	syntaxRangesCacheMu.RLock()
+	defer syntaxRangesCacheMu.RUnlock()
+	if len(syntaxRangesCache) != 0 {
+		t.Fatalf("expected no cache entries for .j2 templates, got %d", len(syntaxRangesCache))
+	}
+}
+
+func TestIsWhitelistedSyntaxExt(t *testing.T) {
+	tests := []struct {
+		ext  string
+		want bool
+	}{
+		{ext: ".go", want: true},
+		{ext: ".py", want: true},
+		{ext: ".sql", want: true},
+		{ext: ".j2", want: false},
+		{ext: ".jinja", want: false},
+		{ext: ".txt", want: false},
+		{ext: "", want: false},
+	}
+
+	for _, tt := range tests {
+		if got := isWhitelistedSyntaxExt(tt.ext); got != tt.want {
+			t.Fatalf("isWhitelistedSyntaxExt(%q) = %v, want %v", tt.ext, got, tt.want)
+		}
+	}
+}
+
 func TestClearSyntaxCacheResetsEntries(t *testing.T) {
 	_ = syntaxRangesForPath("example.go", "if n == 1 { return \"x\" }")
 

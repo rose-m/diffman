@@ -504,7 +504,7 @@ func syntaxRangesForPath(path, text string) []syntaxRange {
 		return nil
 	}
 	ext := strings.ToLower(filepath.Ext(path))
-	if ext == "" {
+	if !isWhitelistedSyntaxExt(ext) {
 		return nil
 	}
 	key := syntaxCacheKey{ext: ext, text: text}
@@ -569,6 +569,15 @@ func syntaxLexerForPath(path string) chroma.Lexer {
 	syntaxLexerCache[name] = lx
 	syntaxLexerCacheMu.Unlock()
 	return lx
+}
+
+func isWhitelistedSyntaxExt(ext string) bool {
+	switch ext {
+	case ".go", ".py", ".sql", ".scala", ".java", ".js", ".jsx", ".ts", ".tsx", ".json", ".yaml", ".yml", ".toml", ".sh", ".bash", ".zsh", ".md":
+		return true
+	default:
+		return false
+	}
 }
 
 func syntaxClassForToken(ttype chroma.TokenType) (syntaxClass, bool) {
