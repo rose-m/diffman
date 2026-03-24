@@ -11,11 +11,16 @@ import (
 )
 
 func main() {
-	var pr string
-	flag.StringVar(&pr, "pr", "", "GitHub pull request number or URL")
+	var prMode bool
+	var prRef string
+	flag.BoolVar(&prMode, "pr", false, "Launch in GitHub PR mode (open PR picker)")
+	flag.StringVar(&prRef, "pr-ref", "", "GitHub pull request number or URL")
 	flag.Parse()
+	if prRef != "" {
+		prMode = true
+	}
 
-	model, err := app.NewModelWithOptions(app.Options{PR: pr})
+	model, err := app.NewModelWithOptions(app.Options{PR: prRef, PRPicker: prMode && prRef == ""})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize app: %v\n", err)
 		os.Exit(1)

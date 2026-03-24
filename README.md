@@ -14,6 +14,7 @@ https://github.com/user-attachments/assets/3cd5cae6-3137-4b85-bad8-30e8eddcc5bd
 - Inline comment display in the diff panes.
 - Comment list view across all files.
 - Export comments to clipboard in a review-friendly format.
+- GitHub PR mode with open-PR picker and review submission.
 - Leader key commands (`<space><key>`) configurable via user config.
 
 ## Requirements
@@ -49,6 +50,14 @@ diffman
 
 `diffman` discovers the repository root automatically and shows changed files.
 
+GitHub PR mode:
+
+```bash
+diffman -pr                # pick from open PRs in current repo
+diffman -pr -pr-ref 123    # open PR number directly
+diffman -pr -pr-ref https://github.com/org/repo/pull/123
+```
+
 ## UI Overview
 
 The app has three views:
@@ -71,6 +80,7 @@ Focus moves with `tab`.
 - `<space><key>`: run configured leader command
 - `?`: toggle expanded help
 - `q`: quit (except in comments view, where it closes comments view)
+- In PR mode: `q` from an active PR returns to PR picker; `q` again quits.
 
 ### Files View
 
@@ -99,6 +109,7 @@ Directory navigation behavior:
 - `d`: delete comment on current line
 - `n` / `p`: jump next/previous comment in current diff
 - `y`: copy exported comments to clipboard
+- `s`: submit PR review (enter body, then choose approve/comment/request changes)
 - `z` or `l`: hide/show file pane
 - `h`: focus files view
 

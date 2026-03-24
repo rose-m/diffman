@@ -22,6 +22,10 @@ func (m *mockPRService) ResolvePR(context.Context, string, string) (githubpr.Con
 	return githubpr.Context{}, nil
 }
 
+func (m *mockPRService) ListOpenPRs(context.Context, string) ([]githubpr.Summary, error) {
+	return nil, nil
+}
+
 func (m *mockPRService) ListFiles(context.Context, githubpr.Context) ([]git.FileItem, error) {
 	return nil, nil
 }

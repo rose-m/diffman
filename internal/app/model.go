@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,7 +49,8 @@ const (
 )
 
 type Options struct {
-	PR string
+	PR       string
+	PRPicker bool
 }
 
 type prDiffCacheEntry struct {
@@ -64,6 +66,16 @@ const (
 type filesLoadedMsg struct {
 	items []gitint.FileItem
 	err   error
+}
+
+type prsLoadedMsg struct {
+	items []githubpr.Summary
+	err   error
+}
+
+type prResolvedMsg struct {
+	ctx githubpr.Context
+	err error
 }
 
 type diffLoadedMsg struct {
@@ -121,6 +133,11 @@ type Model struct {
 	prSvc      githubpr.Service
 	prCtx      *githubpr.Context
 	prDiffs    map[string]prDiffCacheEntry
+	prPicker   bool
+	prItems    []githubpr.Summary
+	prCursor   int
+	prScroll   int
+	loadingPRs bool
 
 	width  int
 	height int
@@ -226,6 +243,7 @@ func NewModelWithOptions(opts Options) (Model, error) {
 	var prCtx *githubpr.Context
 	prDiffs := make(map[string]prDiffCacheEntry)
 	mode := reviewModeLocal
+	prPicker := false
 	if strings.TrimSpace(opts.PR) != "" {
 		ctx, err := prSvc.ResolvePR(context.Background(), repoRoot, opts.PR)
 		if err != nil {
@@ -233,6 +251,9 @@ func NewModelWithOptions(opts Options) (Model, error) {
 		}
 		prCtx = &ctx
 		mode = reviewModePR
+	} else if opts.PRPicker {
+		mode = reviewModePR
+		prPicker = true
 	}
 
 	m := Model{
@@ -246,6 +267,7 @@ func NewModelWithOptions(opts Options) (Model, error) {
 		prSvc:             prSvc,
 		prCtx:             prCtx,
 		prDiffs:           prDiffs,
+		prPicker:          prPicker,
 		helpOpen:          false,
 		filePaneW:         filePaneWidthDefault,
 		treeCollapsed:     make(map[string]bool),
@@ -275,6 +297,10 @@ func NewModelWithOptions(opts Options) (Model, error) {
 }
 
 func (m Model) Init() tea.Cmd {
+	if m.reviewMode == reviewModePR && m.prPicker {
+		m.loadingPRs = true
+		return tea.Batch(m.loadPRsCmd(), alertTickCmd())
+	}
 	m.loadingFiles = true
 	return tea.Batch(m.loadFilesCmd(), alertTickCmd())
 }
@@ -366,6 +392,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case prsLoadedMsg:
+		m.loadingPRs = false
+		m.err = msg.err
+		m.prItems = msg.items
+		if m.prCursor < 0 {
+			m.prCursor = 0
+		}
+		if m.prCursor >= len(m.prItems) {
+			m.prCursor = len(m.prItems) - 1
+		}
+		if m.prCursor < 0 {
+			m.prCursor = 0
+		}
+		return m, nil
+
+	case prResolvedMsg:
+		m.loadingPRs = false
+		if msg.err != nil {
+			m.setAlert(fmt.Sprintf("failed to load PR: %v", msg.err))
+			return m, nil
+		}
+		ctx := msg.ctx
+		m.prCtx = &ctx
+		m.prPicker = false
+		m.prDiffs = make(map[string]prDiffCacheEntry)
+		m.loadingFiles = true
+		return m, m.loadFilesCmd()
+
 	case clipboardResultMsg:
 		if msg.err != nil {
 			m.setAlert(fmt.Sprintf("export failed: %v", msg.err))
@@ -455,7 +509,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if key.Matches(msg, m.keys.Quit) {
+			if m.reviewMode == reviewModePR && !m.prPicker && m.prCtx != nil {
+				m.prPicker = true
+				m.prCtx = nil
+				m.prDiffs = make(map[string]prDiffCacheEntry)
+				m.prCursor = 0
+				m.prScroll = 0
+				m.focus = focusFiles
+				m.fileHidden = false
+				if len(m.prItems) == 0 {
+					m.loadingPRs = true
+					return m, m.loadPRsCmd()
+				}
+				return m, nil
+			}
 			return m, tea.Quit
+		}
+		if m.prPicker {
+			return m.updatePRPicker(msg)
 		}
 		if key.Matches(msg, m.keys.ToggleFocus) {
 			if m.focus == focusFiles {
@@ -593,6 +664,184 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m Model) updatePRPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, m.keys.Refresh) {
+		m.loadingPRs = true
+		return m, m.loadPRsCmd()
+	}
+
+	if len(m.prItems) == 0 {
+		return m, nil
+	}
+	m.clampPRCursor()
+
+	switch {
+	case key.Matches(msg, m.keys.Up):
+		if m.prCursor > 0 {
+			m.prCursor--
+		}
+		m.ensurePRCursorVisible()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Down):
+		if m.prCursor < len(m.prItems)-1 {
+			m.prCursor++
+		}
+		m.ensurePRCursorVisible()
+		return m, nil
+
+	case key.Matches(msg, m.keys.ScrollDown):
+		m.scrollPRWindow(1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.ScrollUp):
+		m.scrollPRWindow(-1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.PageDown):
+		m.pagePRs(1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.PageUp):
+		m.pagePRs(-1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Top):
+		m.prCursor = 0
+		m.ensurePRCursorVisible()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Bottom):
+		m.prCursor = len(m.prItems) - 1
+		m.ensurePRCursorVisible()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Open):
+		selected := m.prItems[m.prCursor]
+		m.loadingPRs = true
+		return m, m.resolvePRCmd(selected.Number)
+	}
+
+	return m, nil
+}
+
+func (m *Model) clampPRCursor() {
+	if len(m.prItems) == 0 {
+		m.prCursor = 0
+		m.prScroll = 0
+		return
+	}
+	if m.prCursor < 0 {
+		m.prCursor = 0
+	}
+	if m.prCursor >= len(m.prItems) {
+		m.prCursor = len(m.prItems) - 1
+	}
+}
+
+func (m *Model) prPageSize() int {
+	if m.height <= 0 {
+		return 1
+	}
+	footerPlain := truncateLinesToWidth(m.helpText(), m.width)
+	footerHeight := lineCount(footerPlain)
+	dockHeight := 0
+	if m.alertMsg != "" {
+		dockHeight = lipgloss.Height(m.renderAlertDock())
+	}
+	paneContentHeight := max(1, m.height-footerHeight-dockHeight-2)
+	listHeight := paneContentHeight - 2
+	if listHeight < 1 {
+		listHeight = 1
+	}
+	return listHeight
+}
+
+func (m *Model) ensurePRCursorVisible() {
+	if len(m.prItems) == 0 {
+		m.prScroll = 0
+		return
+	}
+	page := m.prPageSize()
+	if page < 1 {
+		page = 1
+	}
+	maxScroll := len(m.prItems) - page
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.prScroll < 0 {
+		m.prScroll = 0
+	}
+	if m.prScroll > maxScroll {
+		m.prScroll = maxScroll
+	}
+	if m.prCursor < m.prScroll {
+		m.prScroll = m.prCursor
+	}
+	if m.prCursor >= m.prScroll+page {
+		m.prScroll = m.prCursor - page + 1
+	}
+	if m.prScroll < 0 {
+		m.prScroll = 0
+	}
+	if m.prScroll > maxScroll {
+		m.prScroll = maxScroll
+	}
+}
+
+func (m *Model) scrollPRWindow(delta int) {
+	if len(m.prItems) == 0 || delta == 0 {
+		return
+	}
+	page := m.prPageSize()
+	if page < 1 {
+		page = 1
+	}
+	maxScroll := len(m.prItems) - page
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	oldTop := m.prScroll
+	newTop := oldTop + delta
+	if newTop < 0 {
+		newTop = 0
+	}
+	if newTop > maxScroll {
+		newTop = maxScroll
+	}
+	if newTop == oldTop {
+		return
+	}
+	rel := m.prCursor - oldTop
+	if rel < 0 {
+		rel = 0
+	}
+	if rel >= page {
+		rel = page - 1
+	}
+	m.prScroll = newTop
+	m.prCursor = newTop + rel
+	if m.prCursor >= len(m.prItems) {
+		m.prCursor = len(m.prItems) - 1
+	}
+}
+
+func (m *Model) pagePRs(direction int) {
+	if len(m.prItems) == 0 || direction == 0 {
+		return
+	}
+	page := m.prPageSize()
+	if page < 1 {
+		page = 1
+	}
+	step := page
+	if step > 1 {
+		step--
+	}
+	m.scrollPRWindow(direction * step)
 }
 
 func (m *Model) updateSelectedFileFromCursor(entries []fileTreeEntry) (tea.Model, tea.Cmd) {
@@ -1660,7 +1909,9 @@ func (m Model) View() string {
 	m.refreshDiffContent()
 
 	content := ""
-	if m.focus == focusComments {
+	if m.prPicker {
+		content = m.renderPRPickerPane(m.width, paneContentHeight)
+	} else if m.focus == focusComments {
 		content = m.renderCommentsPane(m.width, paneContentHeight)
 	} else {
 		rightPane := m.renderDiffPanes(oldPaneW, newPaneW, paneContentHeight)
@@ -1688,6 +1939,14 @@ func (m Model) helpText() string {
 	leaderHint := ""
 	if m.leaderPending {
 		leaderHint = "leader pending | "
+	}
+	if m.prPicker {
+		if !m.helpOpen {
+			return leaderHint + "PR picker | j/k move | enter open PR | r refresh | q quit | ? help"
+		}
+		return strings.Join([]string{
+			"PR picker: j/k move, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, enter open PR, r refresh, q quit",
+		}, "\n")
 	}
 	modeHint := ""
 	if m.reviewMode == reviewModePR && m.prCtx != nil {
@@ -1883,6 +2142,82 @@ func (m Model) renderDockPanel(title string, titleColor, borderColor lipgloss.Co
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(borderColor).
 		Render(titleBar + "\n" + bodyBlock)
+}
+
+func (m Model) renderPRPickerPane(width, height int) string {
+	borderColor := lipgloss.Color("245")
+	paneStyle := lipgloss.NewStyle().
+		Width(max(1, width)).
+		Height(max(1, height)).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(borderColor)
+
+	title := "Open Pull Requests"
+	if m.loadingPRs {
+		title += " (loading...)"
+	}
+
+	bodyLines := []string{title, ""}
+	if len(m.prItems) == 0 {
+		if m.loadingPRs {
+			bodyLines = append(bodyLines, "Loading open PRs...")
+		} else {
+			bodyLines = append(bodyLines, "No open PRs found.")
+		}
+		if m.err != nil {
+			bodyLines = append(bodyLines, "", fmt.Sprintf("error: %v", m.err))
+		}
+		return paneStyle.Render(strings.Join(bodyLines, "\n"))
+	}
+
+	cursor := m.prCursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= len(m.prItems) {
+		cursor = len(m.prItems) - 1
+	}
+
+	pageSize := m.prPageSize()
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	maxScroll := len(m.prItems) - pageSize
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	start := m.prScroll
+	if start < 0 {
+		start = 0
+	}
+	if start > maxScroll {
+		start = maxScroll
+	}
+	end := start + pageSize
+	if end > len(m.prItems) {
+		end = len(m.prItems)
+	}
+
+	innerW := max(1, width)
+	for i := start; i < end; i++ {
+		pr := m.prItems[i]
+		prefix := "  "
+		if i == cursor {
+			prefix = "> "
+		}
+		line := fmt.Sprintf("%s#%d %s", prefix, pr.Number, strings.TrimSpace(pr.Title))
+		line = ansi.Truncate(line, innerW, "")
+		style := lipgloss.NewStyle().Width(innerW).MaxWidth(innerW)
+		if i == cursor {
+			style = style.Foreground(lipgloss.Color("39")).Bold(true)
+		}
+		bodyLines = append(bodyLines, style.Render(line))
+	}
+
+	if m.err != nil {
+		bodyLines = append(bodyLines, "", fmt.Sprintf("error: %v", m.err))
+	}
+	return paneStyle.Render(strings.Join(bodyLines, "\n"))
 }
 
 func (m Model) renderFilesPane(width, height int) string {
@@ -2367,6 +2702,25 @@ func (m Model) loadFilesCmd() tea.Cmd {
 	return func() tea.Msg {
 		items, err := service.ListChangedFiles(context.Background(), cwd)
 		return filesLoadedMsg{items: items, err: err}
+	}
+}
+
+func (m Model) loadPRsCmd() tea.Cmd {
+	cwd := m.cwd
+	service := m.prSvc
+	return func() tea.Msg {
+		items, err := service.ListOpenPRs(context.Background(), cwd)
+		return prsLoadedMsg{items: items, err: err}
+	}
+}
+
+func (m Model) resolvePRCmd(number int) tea.Cmd {
+	cwd := m.cwd
+	service := m.prSvc
+	input := strconv.Itoa(number)
+	return func() tea.Msg {
+		ctx, err := service.ResolvePR(context.Background(), cwd, input)
+		return prResolvedMsg{ctx: ctx, err: err}
 	}
 }
 

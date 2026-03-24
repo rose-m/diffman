@@ -17,6 +17,82 @@ import (
 
 type ghService struct{}
 
+func (ghService) ListOpenPRs(ctx context.Context, cwd string) ([]Summary, error) {
+	owner, repo, err := discoverGitHubRepo(ctx, cwd)
+	if err != nil {
+		return nil, err
+	}
+
+	body, err := util.Run(
+		ctx,
+		"",
+		"gh",
+		"api",
+		"--paginate",
+		"--slurp",
+		fmt.Sprintf("repos/%s/%s/pulls?state=open&per_page=100", owner, repo),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	type openPR struct {
+		Number  int    `json:"number"`
+		Title   string `json:"title"`
+		HTMLURL string `json:"html_url"`
+		Head    struct {
+			SHA string `json:"sha"`
+			Ref string `json:"ref"`
+		} `json:"head"`
+		Base struct {
+			Ref string `json:"ref"`
+		} `json:"base"`
+	}
+
+	parse := func(data []byte) ([]openPR, error) {
+		var direct []openPR
+		if err := json.Unmarshal(data, &direct); err == nil {
+			return direct, nil
+		}
+		var pages [][]openPR
+		if err := json.Unmarshal(data, &pages); err != nil {
+			return nil, fmt.Errorf("parse open prs: %w", err)
+		}
+		total := 0
+		for _, page := range pages {
+			total += len(page)
+		}
+		out := make([]openPR, 0, total)
+		for _, page := range pages {
+			out = append(out, page...)
+		}
+		return out, nil
+	}
+
+	openPRs, err := parse([]byte(body))
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]Summary, 0, len(openPRs))
+	for _, pr := range openPRs {
+		out = append(out, Summary{
+			Owner:   owner,
+			Repo:    repo,
+			Number:  pr.Number,
+			Title:   pr.Title,
+			URL:     pr.HTMLURL,
+			HeadSHA: pr.Head.SHA,
+			HeadRef: pr.Head.Ref,
+			BaseRef: pr.Base.Ref,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Number > out[j].Number
+	})
+	return out, nil
+}
+
 func (ghService) ResolvePR(ctx context.Context, cwd, input string) (Context, error) {
 	owner, repo, number, err := parsePRInput(input)
 	if err != nil {
