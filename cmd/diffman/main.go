@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -10,7 +11,11 @@ import (
 )
 
 func main() {
-	model, err := app.NewModel()
+	var pr string
+	flag.StringVar(&pr, "pr", "", "GitHub pull request number or URL")
+	flag.Parse()
+
+	model, err := app.NewModelWithOptions(app.Options{PR: pr})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to initialize app: %v\n", err)
 		os.Exit(1)

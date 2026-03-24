@@ -21,6 +21,7 @@ import (
 	"diffman/internal/config"
 	"diffman/internal/diffview"
 	gitint "diffman/internal/git"
+	"diffman/internal/githubpr"
 )
 
 type focusPane int
@@ -38,6 +39,22 @@ const (
 	diffPaneModeOldOnly
 	diffPaneModeNewOnly
 )
+
+type reviewMode int
+
+const (
+	reviewModeLocal reviewMode = iota
+	reviewModePR
+)
+
+type Options struct {
+	PR string
+}
+
+type prDiffCacheEntry struct {
+	rows  []diffview.DiffRow
+	empty bool
+}
 
 const (
 	filePaneWidthDefault = 40
@@ -81,12 +98,16 @@ type commentAnchor struct {
 
 // Model is the Bubble Tea state container for the app.
 type Model struct {
-	keys      KeyMap
-	focus     focusPane
-	cwd       string
-	diffMode  gitint.DiffMode
-	statusSvc gitint.StatusService
-	diffSvc   gitint.DiffService
+	keys       KeyMap
+	focus      focusPane
+	cwd        string
+	diffMode   gitint.DiffMode
+	reviewMode reviewMode
+	statusSvc  gitint.StatusService
+	diffSvc    gitint.DiffService
+	prSvc      githubpr.Service
+	prCtx      *githubpr.Context
+	prDiffs    map[string]prDiffCacheEntry
 
 	width  int
 	height int
@@ -136,8 +157,11 @@ type Model struct {
 	err          error
 }
 
-// Test
 func NewModel() (Model, error) {
+	return NewModelWithOptions(Options{})
+}
+
+func NewModelWithOptions(opts Options) (Model, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return Model{}, err
@@ -171,13 +195,30 @@ func NewModel() (Model, error) {
 	commentInput.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
 	commentInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
+	prSvc := githubpr.NewService()
+	var prCtx *githubpr.Context
+	prDiffs := make(map[string]prDiffCacheEntry)
+	mode := reviewModeLocal
+	if strings.TrimSpace(opts.PR) != "" {
+		ctx, err := prSvc.ResolvePR(context.Background(), repoRoot, opts.PR)
+		if err != nil {
+			return Model{}, err
+		}
+		prCtx = &ctx
+		mode = reviewModePR
+	}
+
 	m := Model{
 		keys:              defaultKeyMap(),
 		focus:             focusFiles,
 		cwd:               repoRoot,
 		diffMode:          gitint.DiffModeAll,
+		reviewMode:        mode,
 		statusSvc:         gitint.NewStatusService(),
 		diffSvc:           gitint.NewDiffService(),
+		prSvc:             prSvc,
+		prCtx:             prCtx,
+		prDiffs:           prDiffs,
 		helpOpen:          false,
 		filePaneW:         filePaneWidthDefault,
 		treeCollapsed:     make(map[string]bool),
@@ -271,6 +312,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.empty || len(msg.rows) == 0 {
+			if m.reviewMode == reviewModePR {
+				m.prDiffs[msg.path] = prDiffCacheEntry{empty: true}
+			}
 			m.diffRows = nil
 			m.diffCursor = 0
 			m.rowStarts = nil
@@ -280,6 +324,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.oldView.SetContent(noDiff)
 			m.newView.SetContent(noDiff)
 			return m, nil
+		}
+		if m.reviewMode == reviewModePR {
+			m.prDiffs[msg.path] = prDiffCacheEntry{rows: append([]diffview.DiffRow(nil), msg.rows...)}
 		}
 		m.diffRows = msg.rows
 		m.diffCursor = firstRenderableRow(m.diffRows)
@@ -389,10 +436,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if key.Matches(msg, m.keys.Refresh) {
 			diffview.ClearSyntaxCache()
+			if m.reviewMode == reviewModePR {
+				m.prDiffs = make(map[string]prDiffCacheEntry)
+			}
 			m.loadingFiles = true
 			return m, m.loadFilesCmd()
 		}
 		if key.Matches(msg, m.keys.ToggleMode) {
+			if m.reviewMode == reviewModePR {
+				m.setAlert("Diff mode toggle is unavailable in PR mode.")
+				return m, nil
+			}
 			m.advanceDiffMode()
 			if m.selectedF != "" {
 				m.loadingDiff = true
@@ -1383,6 +1437,13 @@ func (m Model) View() string {
 	footerLines := []string{
 		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(footerHelpPlain),
 	}
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		prLine := truncateLinesToWidth(
+			fmt.Sprintf("Review target: PR #%d %s/%s", m.prCtx.Number, m.prCtx.Owner, m.prCtx.Repo),
+			m.width,
+		)
+		footerLines = append(footerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Render(prLine))
+	}
 	if staleCount := m.staleCommentCount(); staleCount > 0 {
 		warn := truncateLinesToWidth(
 			fmt.Sprintf("Warning: %d stale comment(s). They are marked with ⚠ and excluded from export.", staleCount),
@@ -1451,11 +1512,15 @@ func (m Model) helpText() string {
 	if m.leaderPending {
 		leaderHint = "leader pending | "
 	}
+	modeHint := ""
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		modeHint = fmt.Sprintf("PR #%d %s/%s | ", m.prCtx.Number, m.prCtx.Owner, m.prCtx.Repo)
+	}
 	if !m.helpOpen {
-		return leaderHint + "tab focus | m comments view | j/k move | ctrl-f/b page | ctrl-e/y scroll | enter open diff | z zoom/hide files | <space> cmd | t mode | c/e/d comment | n/p comment nav | y export | C clear all | r refresh | ? help | q quit"
+		return leaderHint + modeHint + "tab focus | m comments view | j/k move | ctrl-f/b page | ctrl-e/y scroll | enter open diff | z zoom/hide files | <space> cmd | t mode | c/e/d comment | n/p comment nav | y export | C clear all | r refresh | ? help | q quit"
 	}
 	return strings.Join([]string{
-		"Global: q quit, tab switch focus, m comments view, t toggle diff mode, C clear all comments, ? toggle help",
+		modeHint + "Global: q quit, tab switch focus, m comments view, t toggle diff mode, C clear all comments, ? toggle help",
 		"Leader: <space><key> runs configured command from ~/.config/diffman/config.json",
 		"Files pane: j/k move, ctrl-e/ctrl-y scroll, h/l tree nav, enter open diff, z toggle file pane width, r refresh",
 		"Diff pane: j/k move cursor, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, h focus files, z/l hide/show file list",
@@ -1601,6 +1666,9 @@ func (m Model) renderFilesPane(width, height int) string {
 		BorderForeground(borderColor)
 
 	title := fmt.Sprintf("Files (%d)", len(m.fileItems))
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		title += fmt.Sprintf(" | PR #%d", m.prCtx.Number)
+	}
 	if m.loadingFiles {
 		title += " (loading...)"
 	}
@@ -2014,7 +2082,7 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string, wit
 	if m.selectedF != "" {
 		title = sideLabel + ": " + m.selectedF
 	}
-	title += fmt.Sprintf(" [%s]", m.diffMode.String())
+	title += fmt.Sprintf(" [%s]", m.diffModeLabel())
 	if m.loadingDiff {
 		title += " (loading...)"
 	}
@@ -2023,6 +2091,16 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string, wit
 	header := lipgloss.NewStyle().Bold(true).Width(innerW).MaxWidth(innerW).Render(title)
 
 	return paneStyle.Render(header + "\n\n" + body)
+}
+
+func (m Model) diffModeLabel() string {
+	if m.reviewMode == reviewModePR {
+		if m.prCtx != nil {
+			return fmt.Sprintf("pr #%d", m.prCtx.Number)
+		}
+		return "pr"
+	}
+	return m.diffMode.String()
 }
 
 func (m *Model) resizePanes() {
@@ -2042,6 +2120,15 @@ func (m *Model) resizePanes() {
 }
 
 func (m Model) loadFilesCmd() tea.Cmd {
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		pr := *m.prCtx
+		service := m.prSvc
+		return func() tea.Msg {
+			items, err := service.ListFiles(context.Background(), pr)
+			return filesLoadedMsg{items: items, err: err}
+		}
+	}
+
 	cwd := m.cwd
 	service := m.statusSvc
 	return func() tea.Msg {
@@ -2051,13 +2138,45 @@ func (m Model) loadFilesCmd() tea.Cmd {
 }
 
 func (m Model) loadCommentStaleCmd(items []gitint.FileItem, commentMap map[string]comments.Comment, mode gitint.DiffMode) tea.Cmd {
-	cwd := m.cwd
-	service := m.diffSvc
 	itemSnapshot := append([]gitint.FileItem(nil), items...)
 	commentSnapshot := make([]comments.Comment, 0, len(commentMap))
 	for _, c := range commentMap {
 		commentSnapshot = append(commentSnapshot, c)
 	}
+
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		pr := *m.prCtx
+		service := m.prSvc
+		cache := make(map[string]prDiffCacheEntry, len(m.prDiffs))
+		for k, v := range m.prDiffs {
+			cache[k] = v
+		}
+		return func() tea.Msg {
+			stale, err := buildCommentStaleMapFromRowsLoader(itemSnapshot, commentSnapshot, func(path string) ([]diffview.DiffRow, bool, error) {
+				if cached, ok := cache[path]; ok {
+					return append([]diffview.DiffRow(nil), cached.rows...), cached.empty, nil
+				}
+
+				d, err := service.Diff(context.Background(), pr, path)
+				if err != nil {
+					return nil, false, err
+				}
+				if strings.TrimSpace(d) == "" {
+					return nil, true, nil
+				}
+
+				rows, err := diffview.ParseUnifiedDiff([]byte(d))
+				if err != nil {
+					return nil, false, err
+				}
+				return rows, false, nil
+			})
+			return commentStaleLoadedMsg{stale: stale, err: err}
+		}
+	}
+
+	cwd := m.cwd
+	service := m.diffSvc
 	return func() tea.Msg {
 		stale, err := buildCommentStaleMap(context.Background(), cwd, service, itemSnapshot, commentSnapshot, mode)
 		return commentStaleLoadedMsg{stale: stale, err: err}
@@ -2065,6 +2184,32 @@ func (m Model) loadCommentStaleCmd(items []gitint.FileItem, commentMap map[strin
 }
 
 func (m Model) loadDiffCmd(path string) tea.Cmd {
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		if cached, ok := m.prDiffs[path]; ok {
+			rows := append([]diffview.DiffRow(nil), cached.rows...)
+			return func() tea.Msg {
+				return diffLoadedMsg{path: path, rows: rows, empty: cached.empty}
+			}
+		}
+		pr := *m.prCtx
+		service := m.prSvc
+		return func() tea.Msg {
+			d, err := service.Diff(context.Background(), pr, path)
+			if err != nil {
+				return diffLoadedMsg{path: path, err: err}
+			}
+			if strings.TrimSpace(d) == "" {
+				return diffLoadedMsg{path: path, empty: true}
+			}
+
+			rows, err := diffview.ParseUnifiedDiff([]byte(d))
+			if err != nil {
+				return diffLoadedMsg{path: path, err: err}
+			}
+			return diffLoadedMsg{path: path, rows: rows}
+		}
+	}
+
 	cwd := m.cwd
 	service := m.diffSvc
 	mode := m.diffMode
@@ -2770,6 +2915,16 @@ func buildCommentStaleMap(
 	allComments []comments.Comment,
 	mode gitint.DiffMode,
 ) (map[string]bool, error) {
+	return buildCommentStaleMapFromLoader(items, allComments, func(path string) (string, error) {
+		return diffSvc.Diff(ctx, cwd, path, mode)
+	})
+}
+
+func buildCommentStaleMapFromRowsLoader(
+	items []gitint.FileItem,
+	allComments []comments.Comment,
+	loadRows func(path string) ([]diffview.DiffRow, bool, error),
+) (map[string]bool, error) {
 	stale := make(map[string]bool, len(allComments))
 	if len(allComments) == 0 {
 		return stale, nil
@@ -2792,7 +2947,7 @@ func buildCommentStaleMap(
 
 	var firstErr error
 	for path, group := range byPath {
-		d, err := diffSvc.Diff(ctx, cwd, path, mode)
+		rows, empty, err := loadRows(path)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -2802,18 +2957,7 @@ func buildCommentStaleMap(
 			}
 			continue
 		}
-		if strings.TrimSpace(d) == "" {
-			for _, c := range group {
-				stale[commentKey(c)] = true
-			}
-			continue
-		}
-
-		rows, err := diffview.ParseUnifiedDiff([]byte(d))
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+		if empty || len(rows) == 0 {
 			for _, c := range group {
 				stale[commentKey(c)] = true
 			}
@@ -2842,4 +2986,25 @@ func buildCommentStaleMap(
 	}
 
 	return stale, firstErr
+}
+
+func buildCommentStaleMapFromLoader(
+	items []gitint.FileItem,
+	allComments []comments.Comment,
+	loadDiff func(path string) (string, error),
+) (map[string]bool, error) {
+	return buildCommentStaleMapFromRowsLoader(items, allComments, func(path string) ([]diffview.DiffRow, bool, error) {
+		d, err := loadDiff(path)
+		if err != nil {
+			return nil, false, err
+		}
+		if strings.TrimSpace(d) == "" {
+			return nil, true, nil
+		}
+		rows, err := diffview.ParseUnifiedDiff([]byte(d))
+		if err != nil {
+			return nil, false, err
+		}
+		return rows, false, nil
+	})
 }
