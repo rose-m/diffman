@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"path"
 	"sort"
 	"strconv"
@@ -186,17 +187,32 @@ func (ghService) SubmitReviewComments(ctx context.Context, pr Context, body, eve
 		return fmt.Errorf("marshal review payload: %w", err)
 	}
 
-	_, err = util.RunWithStdin(
+	tmp, err := os.CreateTemp("", "diffman-review-*.json")
+	if err != nil {
+		return fmt.Errorf("create temp review payload: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(payloadJSON); err != nil {
+		tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write temp review payload: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close temp review payload: %w", err)
+	}
+	defer os.Remove(tmpPath)
+
+	_, err = util.Run(
 		ctx,
 		"",
-		string(payloadJSON),
 		"gh",
 		"api",
 		"--method",
 		"POST",
 		fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", pr.Owner, pr.Repo, pr.Number),
 		"--input",
-		"-",
+		tmpPath,
 	)
 	if err != nil {
 		return err
