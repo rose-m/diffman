@@ -25,6 +25,7 @@ type KeyMap struct {
 	NextComment  key.Binding
 	PrevComment  key.Binding
 	Export       key.Binding
+	SubmitReview key.Binding
 	ClearAll     key.Binding
 	CommentsView key.Binding
 }
@@ -52,6 +53,7 @@ func defaultKeyMap() KeyMap {
 		NextComment:  key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "next comment")),
 		PrevComment:  key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "prev comment")),
 		Export:       key.NewBinding(key.WithKeys("y"), key.WithHelp("y", "copy export")),
+		SubmitReview: key.NewBinding(key.WithKeys("s"), key.WithHelp("s", "submit PR comments")),
 		ClearAll:     key.NewBinding(key.WithKeys("C"), key.WithHelp("C", "clear all comments")),
 		CommentsView: key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "comments view")),
 	}

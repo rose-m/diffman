@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"diffman/internal/config"
 	"diffman/internal/diffview"
 	gitint "diffman/internal/git"
+	"diffman/internal/githubpr"
 )
 
 type focusPane int
@@ -39,6 +41,23 @@ const (
 	diffPaneModeNewOnly
 )
 
+type reviewMode int
+
+const (
+	reviewModeLocal reviewMode = iota
+	reviewModePR
+)
+
+type Options struct {
+	PR       string
+	PRPicker bool
+}
+
+type prDiffCacheEntry struct {
+	rows  []diffview.DiffRow
+	empty bool
+}
+
 const (
 	filePaneWidthDefault = 40
 	filePaneWidthWide    = 120
@@ -47,6 +66,16 @@ const (
 type filesLoadedMsg struct {
 	items []gitint.FileItem
 	err   error
+}
+
+type prsLoadedMsg struct {
+	items []githubpr.Summary
+	err   error
+}
+
+type prResolvedMsg struct {
+	ctx githubpr.Context
+	err error
 }
 
 type diffLoadedMsg struct {
@@ -72,6 +101,19 @@ type leaderCommandResultMsg struct {
 	err error
 }
 
+type submitReviewResultMsg struct {
+	submitted []comments.Comment
+	err       error
+}
+
+type reviewEvent string
+
+const (
+	reviewEventComment        reviewEvent = "COMMENT"
+	reviewEventApprove        reviewEvent = "APPROVE"
+	reviewEventRequestChanges reviewEvent = "REQUEST_CHANGES"
+)
+
 type commentAnchor struct {
 	Path   string
 	Side   comments.Side
@@ -81,12 +123,21 @@ type commentAnchor struct {
 
 // Model is the Bubble Tea state container for the app.
 type Model struct {
-	keys      KeyMap
-	focus     focusPane
-	cwd       string
-	diffMode  gitint.DiffMode
-	statusSvc gitint.StatusService
-	diffSvc   gitint.DiffService
+	keys       KeyMap
+	focus      focusPane
+	cwd        string
+	diffMode   gitint.DiffMode
+	reviewMode reviewMode
+	statusSvc  gitint.StatusService
+	diffSvc    gitint.DiffService
+	prSvc      githubpr.Service
+	prCtx      *githubpr.Context
+	prDiffs    map[string]prDiffCacheEntry
+	prPicker   bool
+	prItems    []githubpr.Summary
+	prCursor   int
+	prScroll   int
+	loadingPRs bool
 
 	width  int
 	height int
@@ -126,6 +177,13 @@ type Model struct {
 	commentEditAnchor  *commentAnchor
 	commentEditKey     string
 
+	reviewInputActive bool
+	reviewInputModel  textinput.Model
+	reviewInputErr    string
+	reviewActionModal bool
+	reviewBodyDraft   string
+	reviewDraft       []comments.Comment
+
 	alertMsg           string
 	alertUntil         time.Time
 	clearConfirmModal  bool
@@ -136,8 +194,11 @@ type Model struct {
 	err          error
 }
 
-// Test
 func NewModel() (Model, error) {
+	return NewModelWithOptions(Options{})
+}
+
+func NewModelWithOptions(opts Options) (Model, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return Model{}, err
@@ -171,13 +232,42 @@ func NewModel() (Model, error) {
 	commentInput.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
 	commentInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
+	reviewInput := textinput.New()
+	reviewInput.Prompt = ""
+	reviewInput.Placeholder = "Type review summary"
+	reviewInput.CharLimit = 4096
+	reviewInput.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
+	reviewInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+
+	prSvc := githubpr.NewService()
+	var prCtx *githubpr.Context
+	prDiffs := make(map[string]prDiffCacheEntry)
+	mode := reviewModeLocal
+	prPicker := false
+	if strings.TrimSpace(opts.PR) != "" {
+		ctx, err := prSvc.ResolvePR(context.Background(), repoRoot, opts.PR)
+		if err != nil {
+			return Model{}, err
+		}
+		prCtx = &ctx
+		mode = reviewModePR
+	} else if opts.PRPicker {
+		mode = reviewModePR
+		prPicker = true
+	}
+
 	m := Model{
 		keys:              defaultKeyMap(),
 		focus:             focusFiles,
 		cwd:               repoRoot,
 		diffMode:          gitint.DiffModeAll,
+		reviewMode:        mode,
 		statusSvc:         gitint.NewStatusService(),
 		diffSvc:           gitint.NewDiffService(),
+		prSvc:             prSvc,
+		prCtx:             prCtx,
+		prDiffs:           prDiffs,
+		prPicker:          prPicker,
 		helpOpen:          false,
 		filePaneW:         filePaneWidthDefault,
 		treeCollapsed:     make(map[string]bool),
@@ -187,6 +277,7 @@ func NewModel() (Model, error) {
 		comments:          commentMap,
 		leaderCommands:    appConfig.LeaderCommands,
 		commentInputModel: commentInput,
+		reviewInputModel:  reviewInput,
 		diffDirty:         true,
 		oldWidth:          -1,
 		newWidth:          -1,
@@ -206,6 +297,10 @@ func NewModel() (Model, error) {
 }
 
 func (m Model) Init() tea.Cmd {
+	if m.reviewMode == reviewModePR && m.prPicker {
+		m.loadingPRs = true
+		return tea.Batch(m.loadPRsCmd(), alertTickCmd())
+	}
 	m.loadingFiles = true
 	return tea.Batch(m.loadFilesCmd(), alertTickCmd())
 }
@@ -271,6 +366,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if msg.empty || len(msg.rows) == 0 {
+			if m.reviewMode == reviewModePR {
+				m.prDiffs[msg.path] = prDiffCacheEntry{empty: true}
+			}
 			m.diffRows = nil
 			m.diffCursor = 0
 			m.rowStarts = nil
@@ -281,6 +379,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.newView.SetContent(noDiff)
 			return m, nil
 		}
+		if m.reviewMode == reviewModePR {
+			m.prDiffs[msg.path] = prDiffCacheEntry{rows: append([]diffview.DiffRow(nil), msg.rows...)}
+		}
 		m.diffRows = msg.rows
 		m.diffCursor = firstRenderableRow(m.diffRows)
 		m.diffDirty = true
@@ -290,6 +391,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingCommentJump = nil
 		}
 		return m, nil
+
+	case prsLoadedMsg:
+		m.loadingPRs = false
+		m.err = msg.err
+		m.prItems = msg.items
+		if m.prCursor < 0 {
+			m.prCursor = 0
+		}
+		if m.prCursor >= len(m.prItems) {
+			m.prCursor = len(m.prItems) - 1
+		}
+		if m.prCursor < 0 {
+			m.prCursor = 0
+		}
+		return m, nil
+
+	case prResolvedMsg:
+		m.loadingPRs = false
+		if msg.err != nil {
+			m.setAlert(fmt.Sprintf("failed to load PR: %v", msg.err))
+			return m, nil
+		}
+		ctx := msg.ctx
+		m.prCtx = &ctx
+		m.prPicker = false
+		m.prDiffs = make(map[string]prDiffCacheEntry)
+		m.loadingFiles = true
+		return m, m.loadFilesCmd()
 
 	case clipboardResultMsg:
 		if msg.err != nil {
@@ -321,9 +450,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadingFiles = true
 		return m, m.loadFilesCmd()
 
+	case submitReviewResultMsg:
+		m.resetReviewSubmissionState()
+		if msg.err != nil {
+			m.setAlert(fmt.Sprintf("submit review failed: %v", msg.err))
+			return m, nil
+		}
+		if len(msg.submitted) == 0 {
+			m.setAlert("No comments submitted.")
+			return m, nil
+		}
+		if err := m.removeSubmittedComments(msg.submitted); err != nil {
+			m.setAlert(fmt.Sprintf("submitted to GitHub, but failed to update local drafts: %v", err))
+			return m, nil
+		}
+		m.setAlert(fmt.Sprintf("Submitted %d comment(s) to GitHub.", len(msg.submitted)))
+		return m, nil
+
 	case tea.KeyMsg:
 		if m.commentInputActive {
 			return m.handleCommentInput(msg)
+		}
+		if m.reviewInputActive {
+			return m.handleReviewInput(msg)
+		}
+		if m.reviewActionModal {
+			return m.handleReviewAction(msg)
 		}
 		if m.clearConfirmModal {
 			return m.handleClearConfirm(msg)
@@ -357,7 +509,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if key.Matches(msg, m.keys.Quit) {
+			if m.reviewMode == reviewModePR && !m.prPicker && m.prCtx != nil {
+				m.prPicker = true
+				m.prCtx = nil
+				m.prDiffs = make(map[string]prDiffCacheEntry)
+				m.prCursor = 0
+				m.prScroll = 0
+				m.focus = focusFiles
+				m.fileHidden = false
+				if len(m.prItems) == 0 {
+					m.loadingPRs = true
+					return m, m.loadPRsCmd()
+				}
+				return m, nil
+			}
 			return m, tea.Quit
+		}
+		if m.prPicker {
+			return m.updatePRPicker(msg)
 		}
 		if key.Matches(msg, m.keys.ToggleFocus) {
 			if m.focus == focusFiles {
@@ -389,10 +558,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if key.Matches(msg, m.keys.Refresh) {
 			diffview.ClearSyntaxCache()
+			if m.reviewMode == reviewModePR {
+				m.prDiffs = make(map[string]prDiffCacheEntry)
+			}
 			m.loadingFiles = true
 			return m, m.loadFilesCmd()
 		}
 		if key.Matches(msg, m.keys.ToggleMode) {
+			if m.reviewMode == reviewModePR {
+				m.setAlert("Diff mode toggle is unavailable in PR mode.")
+				return m, nil
+			}
 			m.advanceDiffMode()
 			if m.selectedF != "" {
 				m.loadingDiff = true
@@ -410,6 +586,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.clearConfirmModal = true
 			return m, nil
+		}
+		if key.Matches(msg, m.keys.SubmitReview) {
+			return m.handleSubmitPRComments()
 		}
 
 		if m.focus == focusFiles {
@@ -485,6 +664,184 @@ func (m Model) updateFilesPane(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func (m Model) updatePRPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if key.Matches(msg, m.keys.Refresh) {
+		m.loadingPRs = true
+		return m, m.loadPRsCmd()
+	}
+
+	if len(m.prItems) == 0 {
+		return m, nil
+	}
+	m.clampPRCursor()
+
+	switch {
+	case key.Matches(msg, m.keys.Up):
+		if m.prCursor > 0 {
+			m.prCursor--
+		}
+		m.ensurePRCursorVisible()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Down):
+		if m.prCursor < len(m.prItems)-1 {
+			m.prCursor++
+		}
+		m.ensurePRCursorVisible()
+		return m, nil
+
+	case key.Matches(msg, m.keys.ScrollDown):
+		m.scrollPRWindow(1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.ScrollUp):
+		m.scrollPRWindow(-1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.PageDown):
+		m.pagePRs(1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.PageUp):
+		m.pagePRs(-1)
+		return m, nil
+
+	case key.Matches(msg, m.keys.Top):
+		m.prCursor = 0
+		m.ensurePRCursorVisible()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Bottom):
+		m.prCursor = len(m.prItems) - 1
+		m.ensurePRCursorVisible()
+		return m, nil
+
+	case key.Matches(msg, m.keys.Open):
+		selected := m.prItems[m.prCursor]
+		m.loadingPRs = true
+		return m, m.resolvePRCmd(selected.Number)
+	}
+
+	return m, nil
+}
+
+func (m *Model) clampPRCursor() {
+	if len(m.prItems) == 0 {
+		m.prCursor = 0
+		m.prScroll = 0
+		return
+	}
+	if m.prCursor < 0 {
+		m.prCursor = 0
+	}
+	if m.prCursor >= len(m.prItems) {
+		m.prCursor = len(m.prItems) - 1
+	}
+}
+
+func (m *Model) prPageSize() int {
+	if m.height <= 0 {
+		return 1
+	}
+	footerPlain := truncateLinesToWidth(m.helpText(), m.width)
+	footerHeight := lineCount(footerPlain)
+	dockHeight := 0
+	if m.alertMsg != "" {
+		dockHeight = lipgloss.Height(m.renderAlertDock())
+	}
+	paneContentHeight := max(1, m.height-footerHeight-dockHeight-2)
+	listHeight := paneContentHeight - 2
+	if listHeight < 1 {
+		listHeight = 1
+	}
+	return listHeight
+}
+
+func (m *Model) ensurePRCursorVisible() {
+	if len(m.prItems) == 0 {
+		m.prScroll = 0
+		return
+	}
+	page := m.prPageSize()
+	if page < 1 {
+		page = 1
+	}
+	maxScroll := len(m.prItems) - page
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.prScroll < 0 {
+		m.prScroll = 0
+	}
+	if m.prScroll > maxScroll {
+		m.prScroll = maxScroll
+	}
+	if m.prCursor < m.prScroll {
+		m.prScroll = m.prCursor
+	}
+	if m.prCursor >= m.prScroll+page {
+		m.prScroll = m.prCursor - page + 1
+	}
+	if m.prScroll < 0 {
+		m.prScroll = 0
+	}
+	if m.prScroll > maxScroll {
+		m.prScroll = maxScroll
+	}
+}
+
+func (m *Model) scrollPRWindow(delta int) {
+	if len(m.prItems) == 0 || delta == 0 {
+		return
+	}
+	page := m.prPageSize()
+	if page < 1 {
+		page = 1
+	}
+	maxScroll := len(m.prItems) - page
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	oldTop := m.prScroll
+	newTop := oldTop + delta
+	if newTop < 0 {
+		newTop = 0
+	}
+	if newTop > maxScroll {
+		newTop = maxScroll
+	}
+	if newTop == oldTop {
+		return
+	}
+	rel := m.prCursor - oldTop
+	if rel < 0 {
+		rel = 0
+	}
+	if rel >= page {
+		rel = page - 1
+	}
+	m.prScroll = newTop
+	m.prCursor = newTop + rel
+	if m.prCursor >= len(m.prItems) {
+		m.prCursor = len(m.prItems) - 1
+	}
+}
+
+func (m *Model) pagePRs(direction int) {
+	if len(m.prItems) == 0 || direction == 0 {
+		return
+	}
+	page := m.prPageSize()
+	if page < 1 {
+		page = 1
+	}
+	step := page
+	if step > 1 {
+		step--
+	}
+	m.scrollPRWindow(direction * step)
 }
 
 func (m *Model) updateSelectedFileFromCursor(entries []fileTreeEntry) (tea.Model, tea.Cmd) {
@@ -900,6 +1257,8 @@ func (m *Model) commentsPageSize() int {
 	dockHeight := 0
 	if m.commentInputActive {
 		dockHeight = lipgloss.Height(m.renderCommentDock())
+	} else if m.reviewInputActive {
+		dockHeight = lipgloss.Height(m.renderReviewDock())
 	} else if m.alertMsg != "" {
 		dockHeight = lipgloss.Height(m.renderAlertDock())
 	}
@@ -1127,6 +1486,80 @@ func (m Model) handleExportComments() (tea.Model, tea.Cmd) {
 	return m, m.exportCommentsCmd()
 }
 
+func (m Model) handleSubmitPRComments() (tea.Model, tea.Cmd) {
+	if m.reviewMode != reviewModePR || m.prCtx == nil {
+		m.setAlert("PR submission is only available in PR mode.")
+		return m, nil
+	}
+
+	draft := m.exportableComments()
+	if len(draft) == 0 {
+		m.setAlert("No non-stale comments to submit.")
+		return m, nil
+	}
+
+	m.reviewDraft = append([]comments.Comment(nil), draft...)
+	m.reviewBodyDraft = ""
+	m.reviewInputErr = ""
+	m.reviewInputActive = true
+	m.reviewActionModal = false
+	m.reviewInputModel.SetValue("")
+	cmd := m.reviewInputModel.Focus()
+	m.reviewInputModel.CursorEnd()
+	return m, cmd
+}
+
+func (m Model) handleReviewInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.resetReviewSubmissionState()
+		return m, nil
+	case tea.KeyEnter:
+		m.reviewBodyDraft = strings.TrimSpace(m.reviewInputModel.Value())
+		m.reviewInputActive = false
+		m.reviewActionModal = true
+		m.reviewInputModel.Blur()
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.reviewInputModel, cmd = m.reviewInputModel.Update(msg)
+	m.reviewInputErr = ""
+	return m, cmd
+}
+
+func (m Model) handleReviewAction(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.Type == tea.KeyEsc {
+		m.resetReviewSubmissionState()
+		return m, nil
+	}
+
+	if msg.Type == tea.KeyRunes {
+		switch msg.String() {
+		case "a", "A":
+			m.reviewActionModal = false
+			return m, m.submitReviewCmd(m.reviewDraft, m.reviewBodyDraft, reviewEventApprove)
+		case "c", "C":
+			m.reviewActionModal = false
+			return m, m.submitReviewCmd(m.reviewDraft, m.reviewBodyDraft, reviewEventComment)
+		case "r", "R":
+			m.reviewActionModal = false
+			return m, m.submitReviewCmd(m.reviewDraft, m.reviewBodyDraft, reviewEventRequestChanges)
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) resetReviewSubmissionState() {
+	m.reviewInputActive = false
+	m.reviewActionModal = false
+	m.reviewInputErr = ""
+	m.reviewBodyDraft = ""
+	m.reviewDraft = nil
+	m.reviewInputModel.SetValue("")
+	m.reviewInputModel.Blur()
+}
+
 func (m Model) handleCommentInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc:
@@ -1340,6 +1773,47 @@ func (m *Model) clearAllComments() {
 	m.refreshDiffContent()
 }
 
+func (m *Model) removeSubmittedComments(submitted []comments.Comment) error {
+	if len(submitted) == 0 {
+		return nil
+	}
+
+	remove := make(map[string]bool, len(submitted))
+	for _, c := range submitted {
+		remove[commentKey(c)] = true
+	}
+
+	prevComments := m.comments
+	prevStale := m.commentStale
+
+	nextComments := make(map[string]comments.Comment, len(m.comments))
+	for k, c := range m.comments {
+		if remove[k] {
+			continue
+		}
+		nextComments[k] = c
+	}
+	nextStale := make(map[string]bool, len(m.commentStale))
+	for k, v := range m.commentStale {
+		if remove[k] {
+			continue
+		}
+		nextStale[k] = v
+	}
+
+	m.comments = nextComments
+	m.commentStale = nextStale
+	if err := m.persistComments(); err != nil {
+		m.comments = prevComments
+		m.commentStale = prevStale
+		return err
+	}
+
+	m.diffDirty = true
+	m.refreshDiffContent()
+	return nil
+}
+
 func (m *Model) jumpToComment(direction int) {
 	rows := m.commentRowIndices()
 	if len(rows) == 0 {
@@ -1383,6 +1857,13 @@ func (m Model) View() string {
 	footerLines := []string{
 		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(footerHelpPlain),
 	}
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		prLine := truncateLinesToWidth(
+			fmt.Sprintf("Review target: PR #%d %s/%s", m.prCtx.Number, m.prCtx.Owner, m.prCtx.Repo),
+			m.width,
+		)
+		footerLines = append(footerLines, lipgloss.NewStyle().Foreground(lipgloss.Color("111")).Render(prLine))
+	}
 	if staleCount := m.staleCommentCount(); staleCount > 0 {
 		warn := truncateLinesToWidth(
 			fmt.Sprintf("Warning: %d stale comment(s). They are marked with ⚠ and excluded from export.", staleCount),
@@ -1397,6 +1878,9 @@ func (m Model) View() string {
 	dockHeight := 0
 	if m.commentInputActive {
 		dock = m.renderCommentDock()
+		dockHeight = lipgloss.Height(dock)
+	} else if m.reviewInputActive {
+		dock = m.renderReviewDock()
 		dockHeight = lipgloss.Height(dock)
 	} else if m.alertMsg != "" {
 		dock = m.renderAlertDock()
@@ -1425,7 +1909,9 @@ func (m Model) View() string {
 	m.refreshDiffContent()
 
 	content := ""
-	if m.focus == focusComments {
+	if m.prPicker {
+		content = m.renderPRPickerPane(m.width, paneContentHeight)
+	} else if m.focus == focusComments {
 		content = m.renderCommentsPane(m.width, paneContentHeight)
 	} else {
 		rightPane := m.renderDiffPanes(oldPaneW, newPaneW, paneContentHeight)
@@ -1443,6 +1929,9 @@ func (m Model) View() string {
 	if m.clearConfirmModal {
 		body = overlayCentered(body, m.renderClearAllConfirmModal(), m.width, lipgloss.Height(body))
 	}
+	if m.reviewActionModal {
+		body = overlayCentered(body, m.renderReviewActionModal(), m.width, lipgloss.Height(body))
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, body, footer)
 }
 
@@ -1451,16 +1940,28 @@ func (m Model) helpText() string {
 	if m.leaderPending {
 		leaderHint = "leader pending | "
 	}
+	if m.prPicker {
+		if !m.helpOpen {
+			return leaderHint + "PR picker | j/k move | enter open PR | r refresh | q quit | ? help"
+		}
+		return strings.Join([]string{
+			"PR picker: j/k move, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, enter open PR, r refresh, q quit",
+		}, "\n")
+	}
+	modeHint := ""
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		modeHint = fmt.Sprintf("PR #%d %s/%s | ", m.prCtx.Number, m.prCtx.Owner, m.prCtx.Repo)
+	}
 	if !m.helpOpen {
-		return leaderHint + "tab focus | m comments view | j/k move | ctrl-f/b page | ctrl-e/y scroll | enter open diff | z zoom/hide files | <space> cmd | t mode | c/e/d comment | n/p comment nav | y export | C clear all | r refresh | ? help | q quit"
+		return leaderHint + modeHint + "tab focus | m comments view | j/k move | ctrl-f/b page | ctrl-e/y scroll | enter open diff | z zoom/hide files | <space> cmd | t mode | c/e/d comment | n/p comment nav | y export | s submit PR | C clear all | r refresh | ? help | q quit"
 	}
 	return strings.Join([]string{
-		"Global: q quit, tab switch focus, m comments view, t toggle diff mode, C clear all comments, ? toggle help",
+		modeHint + "Global: q quit, tab switch focus, m comments view, t toggle diff mode, C clear all comments, ? toggle help",
 		"Leader: <space><key> runs configured command from ~/.config/diffman/config.json",
 		"Files pane: j/k move, ctrl-e/ctrl-y scroll, h/l tree nav, enter open diff, z toggle file pane width, r refresh",
 		"Diff pane: j/k move cursor, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, h focus files, z/l hide/show file list",
 		"Comments view: j/k move, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, e edit, d delete, enter jump to diff",
-		"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard",
+		"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard, s submit PR comments",
 	}, "\n")
 }
 
@@ -1521,6 +2022,26 @@ func (m Model) renderCommentDock() string {
 	return m.renderDockPanel(title, lipgloss.Color("39"), lipgloss.Color("39"), body)
 }
 
+func (m Model) renderReviewDock() string {
+	contentW := max(10, m.width-2)
+	bodyInnerW := max(1, contentW-4)
+	inputWidth := max(1, bodyInnerW-4)
+	input := m.reviewInputModel
+	input.Width = inputWidth
+	inputBox := lipgloss.NewStyle().
+		Width(bodyInnerW).
+		MaxWidth(bodyInnerW).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("111")).
+		Padding(0, 1).
+		Render(input.View())
+	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(
+		ansi.Truncate("Enter continue | Esc cancel", bodyInnerW, ""),
+	)
+	body := strings.Join([]string{inputBox, "", hint}, "\n")
+	return m.renderDockPanel("Review Body", lipgloss.Color("111"), lipgloss.Color("111"), body)
+}
+
 func (m Model) renderAlertDock() string {
 	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Auto-hides after 3s")
 	body := strings.Join([]string{
@@ -1563,6 +2084,42 @@ func (m Model) renderClearAllConfirmModal() string {
 		Render(title + "\n" + bodyBlock)
 }
 
+func (m Model) renderReviewActionModal() string {
+	body := strings.Join([]string{
+		"Choose review action:",
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Render("A approve"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render("C comment"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("R request changes"),
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Esc cancel"),
+	}, "\n")
+
+	width := 54
+	if m.width > 0 && m.width-6 < width {
+		width = max(24, m.width-6)
+	}
+
+	title := lipgloss.NewStyle().
+		Width(max(1, width-2)).
+		Padding(0, 1).
+		Bold(true).
+		Foreground(lipgloss.Color("230")).
+		Background(lipgloss.Color("111")).
+		Render("Submit Review")
+
+	bodyBlock := lipgloss.NewStyle().
+		Width(max(1, width-2)).
+		Padding(1, 2).
+		Render(body)
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("111")).
+		Render(title + "\n" + bodyBlock)
+}
+
 func (m Model) renderDockPanel(title string, titleColor, borderColor lipgloss.Color, body string) string {
 	contentW := max(10, m.width-2)
 	titleText := ansi.Truncate(title, max(1, contentW-2), "")
@@ -1587,6 +2144,82 @@ func (m Model) renderDockPanel(title string, titleColor, borderColor lipgloss.Co
 		Render(titleBar + "\n" + bodyBlock)
 }
 
+func (m Model) renderPRPickerPane(width, height int) string {
+	borderColor := lipgloss.Color("245")
+	paneStyle := lipgloss.NewStyle().
+		Width(max(1, width)).
+		Height(max(1, height)).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(borderColor)
+
+	title := "Open Pull Requests"
+	if m.loadingPRs {
+		title += " (loading...)"
+	}
+
+	bodyLines := []string{title, ""}
+	if len(m.prItems) == 0 {
+		if m.loadingPRs {
+			bodyLines = append(bodyLines, "Loading open PRs...")
+		} else {
+			bodyLines = append(bodyLines, "No open PRs found.")
+		}
+		if m.err != nil {
+			bodyLines = append(bodyLines, "", fmt.Sprintf("error: %v", m.err))
+		}
+		return paneStyle.Render(strings.Join(bodyLines, "\n"))
+	}
+
+	cursor := m.prCursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= len(m.prItems) {
+		cursor = len(m.prItems) - 1
+	}
+
+	pageSize := m.prPageSize()
+	if pageSize < 1 {
+		pageSize = 1
+	}
+	maxScroll := len(m.prItems) - pageSize
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	start := m.prScroll
+	if start < 0 {
+		start = 0
+	}
+	if start > maxScroll {
+		start = maxScroll
+	}
+	end := start + pageSize
+	if end > len(m.prItems) {
+		end = len(m.prItems)
+	}
+
+	innerW := max(1, width)
+	for i := start; i < end; i++ {
+		pr := m.prItems[i]
+		prefix := "  "
+		if i == cursor {
+			prefix = "> "
+		}
+		line := fmt.Sprintf("%s#%d %s", prefix, pr.Number, strings.TrimSpace(pr.Title))
+		line = ansi.Truncate(line, innerW, "")
+		style := lipgloss.NewStyle().Width(innerW).MaxWidth(innerW)
+		if i == cursor {
+			style = style.Foreground(lipgloss.Color("39")).Bold(true)
+		}
+		bodyLines = append(bodyLines, style.Render(line))
+	}
+
+	if m.err != nil {
+		bodyLines = append(bodyLines, "", fmt.Sprintf("error: %v", m.err))
+	}
+	return paneStyle.Render(strings.Join(bodyLines, "\n"))
+}
+
 func (m Model) renderFilesPane(width, height int) string {
 	border := lipgloss.NormalBorder()
 	borderColor := lipgloss.Color("245")
@@ -1601,6 +2234,9 @@ func (m Model) renderFilesPane(width, height int) string {
 		BorderForeground(borderColor)
 
 	title := fmt.Sprintf("Files (%d)", len(m.fileItems))
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		title += fmt.Sprintf(" | PR #%d", m.prCtx.Number)
+	}
 	if m.loadingFiles {
 		title += " (loading...)"
 	}
@@ -2014,7 +2650,7 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string, wit
 	if m.selectedF != "" {
 		title = sideLabel + ": " + m.selectedF
 	}
-	title += fmt.Sprintf(" [%s]", m.diffMode.String())
+	title += fmt.Sprintf(" [%s]", m.diffModeLabel())
 	if m.loadingDiff {
 		title += " (loading...)"
 	}
@@ -2023,6 +2659,16 @@ func (m Model) renderDiffSidePane(width, height int, sideLabel, body string, wit
 	header := lipgloss.NewStyle().Bold(true).Width(innerW).MaxWidth(innerW).Render(title)
 
 	return paneStyle.Render(header + "\n\n" + body)
+}
+
+func (m Model) diffModeLabel() string {
+	if m.reviewMode == reviewModePR {
+		if m.prCtx != nil {
+			return fmt.Sprintf("pr #%d", m.prCtx.Number)
+		}
+		return "pr"
+	}
+	return m.diffMode.String()
 }
 
 func (m *Model) resizePanes() {
@@ -2042,6 +2688,15 @@ func (m *Model) resizePanes() {
 }
 
 func (m Model) loadFilesCmd() tea.Cmd {
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		pr := *m.prCtx
+		service := m.prSvc
+		return func() tea.Msg {
+			items, err := service.ListFiles(context.Background(), pr)
+			return filesLoadedMsg{items: items, err: err}
+		}
+	}
+
 	cwd := m.cwd
 	service := m.statusSvc
 	return func() tea.Msg {
@@ -2050,14 +2705,65 @@ func (m Model) loadFilesCmd() tea.Cmd {
 	}
 }
 
-func (m Model) loadCommentStaleCmd(items []gitint.FileItem, commentMap map[string]comments.Comment, mode gitint.DiffMode) tea.Cmd {
+func (m Model) loadPRsCmd() tea.Cmd {
 	cwd := m.cwd
-	service := m.diffSvc
+	service := m.prSvc
+	return func() tea.Msg {
+		items, err := service.ListOpenPRs(context.Background(), cwd)
+		return prsLoadedMsg{items: items, err: err}
+	}
+}
+
+func (m Model) resolvePRCmd(number int) tea.Cmd {
+	cwd := m.cwd
+	service := m.prSvc
+	input := strconv.Itoa(number)
+	return func() tea.Msg {
+		ctx, err := service.ResolvePR(context.Background(), cwd, input)
+		return prResolvedMsg{ctx: ctx, err: err}
+	}
+}
+
+func (m Model) loadCommentStaleCmd(items []gitint.FileItem, commentMap map[string]comments.Comment, mode gitint.DiffMode) tea.Cmd {
 	itemSnapshot := append([]gitint.FileItem(nil), items...)
 	commentSnapshot := make([]comments.Comment, 0, len(commentMap))
 	for _, c := range commentMap {
 		commentSnapshot = append(commentSnapshot, c)
 	}
+
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		pr := *m.prCtx
+		service := m.prSvc
+		cache := make(map[string]prDiffCacheEntry, len(m.prDiffs))
+		for k, v := range m.prDiffs {
+			cache[k] = v
+		}
+		return func() tea.Msg {
+			stale, err := buildCommentStaleMapFromRowsLoader(itemSnapshot, commentSnapshot, func(path string) ([]diffview.DiffRow, bool, error) {
+				if cached, ok := cache[path]; ok {
+					return append([]diffview.DiffRow(nil), cached.rows...), cached.empty, nil
+				}
+
+				d, err := service.Diff(context.Background(), pr, path)
+				if err != nil {
+					return nil, false, err
+				}
+				if strings.TrimSpace(d) == "" {
+					return nil, true, nil
+				}
+
+				rows, err := diffview.ParseUnifiedDiff([]byte(d))
+				if err != nil {
+					return nil, false, err
+				}
+				return rows, false, nil
+			})
+			return commentStaleLoadedMsg{stale: stale, err: err}
+		}
+	}
+
+	cwd := m.cwd
+	service := m.diffSvc
 	return func() tea.Msg {
 		stale, err := buildCommentStaleMap(context.Background(), cwd, service, itemSnapshot, commentSnapshot, mode)
 		return commentStaleLoadedMsg{stale: stale, err: err}
@@ -2065,6 +2771,32 @@ func (m Model) loadCommentStaleCmd(items []gitint.FileItem, commentMap map[strin
 }
 
 func (m Model) loadDiffCmd(path string) tea.Cmd {
+	if m.reviewMode == reviewModePR && m.prCtx != nil {
+		if cached, ok := m.prDiffs[path]; ok {
+			rows := append([]diffview.DiffRow(nil), cached.rows...)
+			return func() tea.Msg {
+				return diffLoadedMsg{path: path, rows: rows, empty: cached.empty}
+			}
+		}
+		pr := *m.prCtx
+		service := m.prSvc
+		return func() tea.Msg {
+			d, err := service.Diff(context.Background(), pr, path)
+			if err != nil {
+				return diffLoadedMsg{path: path, err: err}
+			}
+			if strings.TrimSpace(d) == "" {
+				return diffLoadedMsg{path: path, empty: true}
+			}
+
+			rows, err := diffview.ParseUnifiedDiff([]byte(d))
+			if err != nil {
+				return diffLoadedMsg{path: path, err: err}
+			}
+			return diffLoadedMsg{path: path, rows: rows}
+		}
+	}
+
 	cwd := m.cwd
 	service := m.diffSvc
 	mode := m.diffMode
@@ -2091,6 +2823,21 @@ func (m Model) exportCommentsCmd() tea.Cmd {
 		text := comments.ExportPlain(snapshot, "Review comments:")
 		err := clipboard.CopyText(context.Background(), text)
 		return clipboardResultMsg{err: err}
+	}
+}
+
+func (m Model) submitReviewCmd(draft []comments.Comment, body string, event reviewEvent) tea.Cmd {
+	pr := m.prCtx
+	service := m.prSvc
+	snapshot := append([]comments.Comment(nil), draft...)
+	bodySnapshot := strings.TrimSpace(body)
+	eventSnapshot := string(event)
+	return func() tea.Msg {
+		if pr == nil {
+			return submitReviewResultMsg{err: fmt.Errorf("missing PR context")}
+		}
+		err := service.SubmitReviewComments(context.Background(), *pr, bodySnapshot, eventSnapshot, snapshot)
+		return submitReviewResultMsg{submitted: snapshot, err: err}
 	}
 }
 
@@ -2770,6 +3517,16 @@ func buildCommentStaleMap(
 	allComments []comments.Comment,
 	mode gitint.DiffMode,
 ) (map[string]bool, error) {
+	return buildCommentStaleMapFromLoader(items, allComments, func(path string) (string, error) {
+		return diffSvc.Diff(ctx, cwd, path, mode)
+	})
+}
+
+func buildCommentStaleMapFromRowsLoader(
+	items []gitint.FileItem,
+	allComments []comments.Comment,
+	loadRows func(path string) ([]diffview.DiffRow, bool, error),
+) (map[string]bool, error) {
 	stale := make(map[string]bool, len(allComments))
 	if len(allComments) == 0 {
 		return stale, nil
@@ -2792,7 +3549,7 @@ func buildCommentStaleMap(
 
 	var firstErr error
 	for path, group := range byPath {
-		d, err := diffSvc.Diff(ctx, cwd, path, mode)
+		rows, empty, err := loadRows(path)
 		if err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -2802,18 +3559,7 @@ func buildCommentStaleMap(
 			}
 			continue
 		}
-		if strings.TrimSpace(d) == "" {
-			for _, c := range group {
-				stale[commentKey(c)] = true
-			}
-			continue
-		}
-
-		rows, err := diffview.ParseUnifiedDiff([]byte(d))
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+		if empty || len(rows) == 0 {
 			for _, c := range group {
 				stale[commentKey(c)] = true
 			}
@@ -2842,4 +3588,25 @@ func buildCommentStaleMap(
 	}
 
 	return stale, firstErr
+}
+
+func buildCommentStaleMapFromLoader(
+	items []gitint.FileItem,
+	allComments []comments.Comment,
+	loadDiff func(path string) (string, error),
+) (map[string]bool, error) {
+	return buildCommentStaleMapFromRowsLoader(items, allComments, func(path string) ([]diffview.DiffRow, bool, error) {
+		d, err := loadDiff(path)
+		if err != nil {
+			return nil, false, err
+		}
+		if strings.TrimSpace(d) == "" {
+			return nil, true, nil
+		}
+		rows, err := diffview.ParseUnifiedDiff([]byte(d))
+		if err != nil {
+			return nil, false, err
+		}
+		return rows, false, nil
+	})
 }
