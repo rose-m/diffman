@@ -13,8 +13,9 @@ import (
 )
 
 type mockPRService struct {
-	diffCalls int
-	patches   map[string]string
+	diffCalls   int
+	submitCalls int
+	patches     map[string]string
 }
 
 func (m *mockPRService) ResolvePR(context.Context, string, string) (githubpr.Context, error) {
@@ -28,6 +29,11 @@ func (m *mockPRService) ListFiles(context.Context, githubpr.Context) ([]git.File
 func (m *mockPRService) Diff(_ context.Context, _ githubpr.Context, path string) (string, error) {
 	m.diffCalls++
 	return m.patches[path], nil
+}
+
+func (m *mockPRService) SubmitReviewComments(context.Context, githubpr.Context, string, string, []comments.Comment) error {
+	m.submitCalls++
+	return nil
 }
 
 func TestPRModeDiffCachingAvoidsSecondFetch(t *testing.T) {
@@ -101,5 +107,39 @@ func TestPRModeStaleCheckUsesDiffCacheWhenAvailable(t *testing.T) {
 	}
 	if stale := msg.stale[comments.AnchorKey("a.go", comments.SideNew, 1)]; stale {
 		t.Fatalf("expected cached-line comment to be non-stale")
+	}
+}
+
+func TestSubmitPRCommentsRemovesSubmittedDrafts(t *testing.T) {
+	service := &mockPRService{}
+	key := comments.AnchorKey("a.go", comments.SideNew, 1)
+	draft := comments.Comment{Path: "a.go", Side: comments.SideNew, Line: 1, Body: "ship it"}
+
+	m := Model{
+		reviewMode:   reviewModePR,
+		prSvc:        service,
+		prCtx:        &githubpr.Context{Owner: "acme", Repo: "widgets", Number: 42},
+		commentStore: comments.NewStore(t.TempDir()),
+		comments: map[string]comments.Comment{
+			key: draft,
+		},
+		commentStale: map[string]bool{key: false},
+		oldView:      viewport.New(80, 20),
+		newView:      viewport.New(80, 20),
+	}
+
+	cmd := m.submitReviewCmd([]comments.Comment{draft}, "body", reviewEventComment)
+	msg := cmd().(submitReviewResultMsg)
+	nextModel, _ := m.Update(msg)
+	m2 := nextModel.(Model)
+
+	if service.submitCalls != 1 {
+		t.Fatalf("expected one submit call, got %d", service.submitCalls)
+	}
+	if len(m2.comments) != 0 {
+		t.Fatalf("expected submitted comment to be removed locally")
+	}
+	if len(m2.commentStale) != 0 {
+		t.Fatalf("expected stale map entry removed with submitted comment")
 	}
 }

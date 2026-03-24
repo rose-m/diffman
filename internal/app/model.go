@@ -89,6 +89,19 @@ type leaderCommandResultMsg struct {
 	err error
 }
 
+type submitReviewResultMsg struct {
+	submitted []comments.Comment
+	err       error
+}
+
+type reviewEvent string
+
+const (
+	reviewEventComment        reviewEvent = "COMMENT"
+	reviewEventApprove        reviewEvent = "APPROVE"
+	reviewEventRequestChanges reviewEvent = "REQUEST_CHANGES"
+)
+
 type commentAnchor struct {
 	Path   string
 	Side   comments.Side
@@ -147,6 +160,13 @@ type Model struct {
 	commentEditAnchor  *commentAnchor
 	commentEditKey     string
 
+	reviewInputActive bool
+	reviewInputModel  textinput.Model
+	reviewInputErr    string
+	reviewActionModal bool
+	reviewBodyDraft   string
+	reviewDraft       []comments.Comment
+
 	alertMsg           string
 	alertUntil         time.Time
 	clearConfirmModal  bool
@@ -195,6 +215,13 @@ func NewModelWithOptions(opts Options) (Model, error) {
 	commentInput.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
 	commentInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
+	reviewInput := textinput.New()
+	reviewInput.Prompt = ""
+	reviewInput.Placeholder = "Type review summary"
+	reviewInput.CharLimit = 4096
+	reviewInput.Cursor.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("51"))
+	reviewInput.PlaceholderStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+
 	prSvc := githubpr.NewService()
 	var prCtx *githubpr.Context
 	prDiffs := make(map[string]prDiffCacheEntry)
@@ -228,6 +255,7 @@ func NewModelWithOptions(opts Options) (Model, error) {
 		comments:          commentMap,
 		leaderCommands:    appConfig.LeaderCommands,
 		commentInputModel: commentInput,
+		reviewInputModel:  reviewInput,
 		diffDirty:         true,
 		oldWidth:          -1,
 		newWidth:          -1,
@@ -368,9 +396,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loadingFiles = true
 		return m, m.loadFilesCmd()
 
+	case submitReviewResultMsg:
+		m.resetReviewSubmissionState()
+		if msg.err != nil {
+			m.setAlert(fmt.Sprintf("submit review failed: %v", msg.err))
+			return m, nil
+		}
+		if len(msg.submitted) == 0 {
+			m.setAlert("No comments submitted.")
+			return m, nil
+		}
+		if err := m.removeSubmittedComments(msg.submitted); err != nil {
+			m.setAlert(fmt.Sprintf("submitted to GitHub, but failed to update local drafts: %v", err))
+			return m, nil
+		}
+		m.setAlert(fmt.Sprintf("Submitted %d comment(s) to GitHub.", len(msg.submitted)))
+		return m, nil
+
 	case tea.KeyMsg:
 		if m.commentInputActive {
 			return m.handleCommentInput(msg)
+		}
+		if m.reviewInputActive {
+			return m.handleReviewInput(msg)
+		}
+		if m.reviewActionModal {
+			return m.handleReviewAction(msg)
 		}
 		if m.clearConfirmModal {
 			return m.handleClearConfirm(msg)
@@ -464,6 +515,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.clearConfirmModal = true
 			return m, nil
+		}
+		if key.Matches(msg, m.keys.SubmitReview) {
+			return m.handleSubmitPRComments()
 		}
 
 		if m.focus == focusFiles {
@@ -954,6 +1008,8 @@ func (m *Model) commentsPageSize() int {
 	dockHeight := 0
 	if m.commentInputActive {
 		dockHeight = lipgloss.Height(m.renderCommentDock())
+	} else if m.reviewInputActive {
+		dockHeight = lipgloss.Height(m.renderReviewDock())
 	} else if m.alertMsg != "" {
 		dockHeight = lipgloss.Height(m.renderAlertDock())
 	}
@@ -1181,6 +1237,80 @@ func (m Model) handleExportComments() (tea.Model, tea.Cmd) {
 	return m, m.exportCommentsCmd()
 }
 
+func (m Model) handleSubmitPRComments() (tea.Model, tea.Cmd) {
+	if m.reviewMode != reviewModePR || m.prCtx == nil {
+		m.setAlert("PR submission is only available in PR mode.")
+		return m, nil
+	}
+
+	draft := m.exportableComments()
+	if len(draft) == 0 {
+		m.setAlert("No non-stale comments to submit.")
+		return m, nil
+	}
+
+	m.reviewDraft = append([]comments.Comment(nil), draft...)
+	m.reviewBodyDraft = ""
+	m.reviewInputErr = ""
+	m.reviewInputActive = true
+	m.reviewActionModal = false
+	m.reviewInputModel.SetValue("")
+	cmd := m.reviewInputModel.Focus()
+	m.reviewInputModel.CursorEnd()
+	return m, cmd
+}
+
+func (m Model) handleReviewInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.resetReviewSubmissionState()
+		return m, nil
+	case tea.KeyEnter:
+		m.reviewBodyDraft = strings.TrimSpace(m.reviewInputModel.Value())
+		m.reviewInputActive = false
+		m.reviewActionModal = true
+		m.reviewInputModel.Blur()
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.reviewInputModel, cmd = m.reviewInputModel.Update(msg)
+	m.reviewInputErr = ""
+	return m, cmd
+}
+
+func (m Model) handleReviewAction(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.Type == tea.KeyEsc {
+		m.resetReviewSubmissionState()
+		return m, nil
+	}
+
+	if msg.Type == tea.KeyRunes {
+		switch msg.String() {
+		case "a", "A":
+			m.reviewActionModal = false
+			return m, m.submitReviewCmd(m.reviewDraft, m.reviewBodyDraft, reviewEventApprove)
+		case "c", "C":
+			m.reviewActionModal = false
+			return m, m.submitReviewCmd(m.reviewDraft, m.reviewBodyDraft, reviewEventComment)
+		case "r", "R":
+			m.reviewActionModal = false
+			return m, m.submitReviewCmd(m.reviewDraft, m.reviewBodyDraft, reviewEventRequestChanges)
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) resetReviewSubmissionState() {
+	m.reviewInputActive = false
+	m.reviewActionModal = false
+	m.reviewInputErr = ""
+	m.reviewBodyDraft = ""
+	m.reviewDraft = nil
+	m.reviewInputModel.SetValue("")
+	m.reviewInputModel.Blur()
+}
+
 func (m Model) handleCommentInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyEsc:
@@ -1394,6 +1524,47 @@ func (m *Model) clearAllComments() {
 	m.refreshDiffContent()
 }
 
+func (m *Model) removeSubmittedComments(submitted []comments.Comment) error {
+	if len(submitted) == 0 {
+		return nil
+	}
+
+	remove := make(map[string]bool, len(submitted))
+	for _, c := range submitted {
+		remove[commentKey(c)] = true
+	}
+
+	prevComments := m.comments
+	prevStale := m.commentStale
+
+	nextComments := make(map[string]comments.Comment, len(m.comments))
+	for k, c := range m.comments {
+		if remove[k] {
+			continue
+		}
+		nextComments[k] = c
+	}
+	nextStale := make(map[string]bool, len(m.commentStale))
+	for k, v := range m.commentStale {
+		if remove[k] {
+			continue
+		}
+		nextStale[k] = v
+	}
+
+	m.comments = nextComments
+	m.commentStale = nextStale
+	if err := m.persistComments(); err != nil {
+		m.comments = prevComments
+		m.commentStale = prevStale
+		return err
+	}
+
+	m.diffDirty = true
+	m.refreshDiffContent()
+	return nil
+}
+
 func (m *Model) jumpToComment(direction int) {
 	rows := m.commentRowIndices()
 	if len(rows) == 0 {
@@ -1459,6 +1630,9 @@ func (m Model) View() string {
 	if m.commentInputActive {
 		dock = m.renderCommentDock()
 		dockHeight = lipgloss.Height(dock)
+	} else if m.reviewInputActive {
+		dock = m.renderReviewDock()
+		dockHeight = lipgloss.Height(dock)
 	} else if m.alertMsg != "" {
 		dock = m.renderAlertDock()
 		dockHeight = lipgloss.Height(dock)
@@ -1504,6 +1678,9 @@ func (m Model) View() string {
 	if m.clearConfirmModal {
 		body = overlayCentered(body, m.renderClearAllConfirmModal(), m.width, lipgloss.Height(body))
 	}
+	if m.reviewActionModal {
+		body = overlayCentered(body, m.renderReviewActionModal(), m.width, lipgloss.Height(body))
+	}
 	return lipgloss.JoinVertical(lipgloss.Left, body, footer)
 }
 
@@ -1517,7 +1694,7 @@ func (m Model) helpText() string {
 		modeHint = fmt.Sprintf("PR #%d %s/%s | ", m.prCtx.Number, m.prCtx.Owner, m.prCtx.Repo)
 	}
 	if !m.helpOpen {
-		return leaderHint + modeHint + "tab focus | m comments view | j/k move | ctrl-f/b page | ctrl-e/y scroll | enter open diff | z zoom/hide files | <space> cmd | t mode | c/e/d comment | n/p comment nav | y export | C clear all | r refresh | ? help | q quit"
+		return leaderHint + modeHint + "tab focus | m comments view | j/k move | ctrl-f/b page | ctrl-e/y scroll | enter open diff | z zoom/hide files | <space> cmd | t mode | c/e/d comment | n/p comment nav | y export | s submit PR | C clear all | r refresh | ? help | q quit"
 	}
 	return strings.Join([]string{
 		modeHint + "Global: q quit, tab switch focus, m comments view, t toggle diff mode, C clear all comments, ? toggle help",
@@ -1525,7 +1702,7 @@ func (m Model) helpText() string {
 		"Files pane: j/k move, ctrl-e/ctrl-y scroll, h/l tree nav, enter open diff, z toggle file pane width, r refresh",
 		"Diff pane: j/k move cursor, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, h focus files, z/l hide/show file list",
 		"Comments view: j/k move, ctrl-e/ctrl-y scroll, ctrl-f/ctrl-b page, g/G top/bottom, e edit, d delete, enter jump to diff",
-		"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard",
+		"Comments: c create, e edit, d delete, n/p next/prev, y export to clipboard, s submit PR comments",
 	}, "\n")
 }
 
@@ -1586,6 +1763,26 @@ func (m Model) renderCommentDock() string {
 	return m.renderDockPanel(title, lipgloss.Color("39"), lipgloss.Color("39"), body)
 }
 
+func (m Model) renderReviewDock() string {
+	contentW := max(10, m.width-2)
+	bodyInnerW := max(1, contentW-4)
+	inputWidth := max(1, bodyInnerW-4)
+	input := m.reviewInputModel
+	input.Width = inputWidth
+	inputBox := lipgloss.NewStyle().
+		Width(bodyInnerW).
+		MaxWidth(bodyInnerW).
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("111")).
+		Padding(0, 1).
+		Render(input.View())
+	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render(
+		ansi.Truncate("Enter continue | Esc cancel", bodyInnerW, ""),
+	)
+	body := strings.Join([]string{inputBox, "", hint}, "\n")
+	return m.renderDockPanel("Review Body", lipgloss.Color("111"), lipgloss.Color("111"), body)
+}
+
 func (m Model) renderAlertDock() string {
 	hint := lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Auto-hides after 3s")
 	body := strings.Join([]string{
@@ -1625,6 +1822,42 @@ func (m Model) renderClearAllConfirmModal() string {
 		Width(width).
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(lipgloss.Color("196")).
+		Render(title + "\n" + bodyBlock)
+}
+
+func (m Model) renderReviewActionModal() string {
+	body := strings.Join([]string{
+		"Choose review action:",
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Render("A approve"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("252")).Render("C comment"),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Render("R request changes"),
+		"",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).Render("Esc cancel"),
+	}, "\n")
+
+	width := 54
+	if m.width > 0 && m.width-6 < width {
+		width = max(24, m.width-6)
+	}
+
+	title := lipgloss.NewStyle().
+		Width(max(1, width-2)).
+		Padding(0, 1).
+		Bold(true).
+		Foreground(lipgloss.Color("230")).
+		Background(lipgloss.Color("111")).
+		Render("Submit Review")
+
+	bodyBlock := lipgloss.NewStyle().
+		Width(max(1, width-2)).
+		Padding(1, 2).
+		Render(body)
+
+	return lipgloss.NewStyle().
+		Width(width).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("111")).
 		Render(title + "\n" + bodyBlock)
 }
 
@@ -2236,6 +2469,21 @@ func (m Model) exportCommentsCmd() tea.Cmd {
 		text := comments.ExportPlain(snapshot, "Review comments:")
 		err := clipboard.CopyText(context.Background(), text)
 		return clipboardResultMsg{err: err}
+	}
+}
+
+func (m Model) submitReviewCmd(draft []comments.Comment, body string, event reviewEvent) tea.Cmd {
+	pr := m.prCtx
+	service := m.prSvc
+	snapshot := append([]comments.Comment(nil), draft...)
+	bodySnapshot := strings.TrimSpace(body)
+	eventSnapshot := string(event)
+	return func() tea.Msg {
+		if pr == nil {
+			return submitReviewResultMsg{err: fmt.Errorf("missing PR context")}
+		}
+		err := service.SubmitReviewComments(context.Background(), *pr, bodySnapshot, eventSnapshot, snapshot)
+		return submitReviewResultMsg{submitted: snapshot, err: err}
 	}
 }
 

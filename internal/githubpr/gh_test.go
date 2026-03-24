@@ -3,6 +3,8 @@ package githubpr
 import (
 	"strings"
 	"testing"
+
+	"diffman/internal/comments"
 )
 
 func TestParsePRInput_Number(t *testing.T) {
@@ -82,5 +84,31 @@ func TestParsePaginatedFilesJSON_SlurpFormat(t *testing.T) {
 	}
 	if files[0].Filename != "a.go" || files[1].Filename != "b.go" {
 		t.Fatalf("unexpected filenames: %#v", files)
+	}
+}
+
+func TestBuildSubmitReviewPayload_MapsCommentSides(t *testing.T) {
+	payload := buildSubmitReviewPayload(Context{HeadSHA: "abc123"}, "summary", "APPROVE", []comments.Comment{
+		{Path: "a.go", Side: comments.SideNew, Line: 7, Body: "new-side"},
+		{Path: "a.go", Side: comments.SideOld, Line: 3, Body: "old-side"},
+	})
+
+	if payload.Event != "APPROVE" {
+		t.Fatalf("expected APPROVE event, got %q", payload.Event)
+	}
+	if payload.Body != "summary" {
+		t.Fatalf("expected custom review body")
+	}
+	if payload.CommitID != "abc123" {
+		t.Fatalf("expected commit id to match head sha")
+	}
+	if len(payload.Comments) != 2 {
+		t.Fatalf("expected 2 payload comments, got %d", len(payload.Comments))
+	}
+	if payload.Comments[0].Side != "RIGHT" {
+		t.Fatalf("expected new-side comment mapped to RIGHT, got %q", payload.Comments[0].Side)
+	}
+	if payload.Comments[1].Side != "LEFT" {
+		t.Fatalf("expected old-side comment mapped to LEFT, got %q", payload.Comments[1].Side)
 	}
 }

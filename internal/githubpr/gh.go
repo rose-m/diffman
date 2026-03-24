@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"diffman/internal/comments"
 	gitint "diffman/internal/git"
 	"diffman/internal/util"
 )
@@ -97,6 +98,78 @@ func (ghService) Diff(ctx context.Context, pr Context, targetPath string) (strin
 	}
 
 	return "", nil
+}
+
+func (ghService) SubmitReviewComments(ctx context.Context, pr Context, body, event string, draft []comments.Comment) error {
+	if len(draft) == 0 {
+		return nil
+	}
+	payload := buildSubmitReviewPayload(pr, body, event, draft)
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal review payload: %w", err)
+	}
+
+	_, err = util.RunWithStdin(
+		ctx,
+		"",
+		string(payloadJSON),
+		"gh",
+		"api",
+		"--method",
+		"POST",
+		fmt.Sprintf("repos/%s/%s/pulls/%d/reviews", pr.Owner, pr.Repo, pr.Number),
+		"--input",
+		"-",
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+type reviewCommentPayload struct {
+	Path string `json:"path"`
+	Body string `json:"body"`
+	Line int    `json:"line"`
+	Side string `json:"side"`
+}
+
+type submitReviewPayload struct {
+	Body     string                 `json:"body,omitempty"`
+	Event    string                 `json:"event"`
+	CommitID string                 `json:"commit_id,omitempty"`
+	Comments []reviewCommentPayload `json:"comments"`
+}
+
+func buildSubmitReviewPayload(pr Context, body, event string, draft []comments.Comment) submitReviewPayload {
+	reviewBody := strings.TrimSpace(body)
+	if reviewBody == "" {
+		reviewBody = "Review comments submitted via diffman."
+	}
+	reviewEvent := strings.ToUpper(strings.TrimSpace(event))
+	if reviewEvent == "" {
+		reviewEvent = "COMMENT"
+	}
+	payload := submitReviewPayload{
+		Body:     reviewBody,
+		Event:    reviewEvent,
+		CommitID: pr.HeadSHA,
+		Comments: make([]reviewCommentPayload, 0, len(draft)),
+	}
+	for _, c := range draft {
+		side := "RIGHT"
+		if c.Side == comments.SideOld {
+			side = "LEFT"
+		}
+		payload.Comments = append(payload.Comments, reviewCommentPayload{
+			Path: c.Path,
+			Body: c.Body,
+			Line: c.Line,
+			Side: side,
+		})
+	}
+	return payload
 }
 
 type prFile struct {
